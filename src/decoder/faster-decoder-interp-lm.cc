@@ -84,10 +84,7 @@ void FasterDecoderInterpLm::AdvanceDecoding(DecodableInterface *decodable,
 
 bool FasterDecoderInterpLm::ReachedFinal() {
   for (const Elem *e = toks_.GetList(); e != NULL; e = e->tail) {
-    StateTriplet state = e->key;
-    if (e->val->TotalCost() != std::numeric_limits<double>::infinity() &&
-        hcl_.Final(state[0]) != Weight::Zero() &&
-        FinalLmCost(state[1], state[2]) != std::numeric_limits<double>::infinity())
+    if (e->val->TotalFinalCost(hcl_, lm1_, lm2_) != std::numeric_limits<double>::infinity())
       return true;
   }
   return false;
@@ -112,9 +109,7 @@ bool FasterDecoderInterpLm::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
     const double infinity =  std::numeric_limits<double>::infinity();
     double best_cost = infinity;
     for (const Elem *e = toks_.GetList(); e != NULL; e = e->tail) {
-      const StateTriplet state = e->key;
-      const double this_cost = e->val->TotalCost() + hcl_.Final(state[0]).Value() +
-          FinalLmCost(state[1], state[2]);
+      const double this_cost = e->val->TotalFinalCost(hcl_, lm1_, lm2_);
       if (this_cost < best_cost && this_cost != infinity) {
         best_cost = this_cost;
         best_tok = e->val;
@@ -147,8 +142,8 @@ bool FasterDecoderInterpLm::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
     cur_state = arc.nextstate;
   }
   if (is_final && use_final_probs) {
-    const BaseFloat final_weight = hcl_.Final(best_tok->state_[0]).Value() +
-        FinalLmCost(best_tok->state_[1], best_tok->state_[2]);
+    const BaseFloat final_weight =
+        best_tok->TotalFinalCost(hcl_, lm1_, lm2_) - best_tok->TotalCost();
     fst_out->SetFinal(cur_state, LatticeWeight(final_weight, 0.0));
   } else {
     fst_out->SetFinal(cur_state, LatticeWeight::One());
@@ -406,12 +401,6 @@ void FasterDecoderInterpLm::FindLmArcs(StateId state_lm1, StateId state_lm2, Lab
       arc_lm2->nextstate = fst::kNoStateId;
     }
   }
-}
-
-BaseFloat FasterDecoderInterpLm::FinalLmCost(StateId state_lm1, StateId state_lm2) const {
-  const Weight w1 = state_lm1 == fst::kNoStateId ? Weight::Zero() : lm1_.Final(state_lm1);
-  const Weight w2 = state_lm2 == fst::kNoStateId ? Weight::Zero() : lm2_.Final(state_lm2);
-  return -kaldi::LogAdd(-w1.Value(), -w2.Value());
 }
 
 } // end namespace kaldi.

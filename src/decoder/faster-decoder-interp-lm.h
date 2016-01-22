@@ -68,7 +68,7 @@ class FasterDecoderInterpLm {
   typedef Arc::StateId StateId;
   typedef Arc::Weight Weight;
 
-  FasterDecoderInterpLm(const fst::Fst<fst::StdArc> &fst,
+  FasterDecoderInterpLm(const fst::Fst<fst::StdArc> &hcl,
                         fst::DeterministicOnDemandFst<fst::StdArc> &lm1,
                         fst::DeterministicOnDemandFst<fst::StdArc> &lm2,
                         const FasterDecoderInterpLmOptions &config);
@@ -142,41 +142,41 @@ class FasterDecoderInterpLm {
     // "cost_" and prev->cost_.
     Token *prev_;
     int32 ref_count_;
-    inline Token(const Arc &arc_clg, const Arc &arc_lm1, const Arc &arc_lm2,
+    inline Token(const Arc &arc_hcl, const Arc &arc_lm1, const Arc &arc_lm2,
                  BaseFloat ac_cost, Token *prev):
-        state_(arc_clg.nextstate, arc_lm1.nextstate, arc_lm2.nextstate),
-        ilabel_(arc_clg.ilabel), olabel_(arc_lm1.olabel), prev_(prev), ref_count_(1) {
+        state_(arc_hcl.nextstate, arc_lm1.nextstate, arc_lm2.nextstate),
+        ilabel_(arc_hcl.ilabel), olabel_(arc_lm1.olabel), prev_(prev), ref_count_(1) {
 #ifdef KALDI_PARANOID
       KALDI_ASSERT(arc_lm1.olabel == arc_lm2.olabel);
 #endif
       if (prev) {
         prev->ref_count_++;
-        cost_[0] = prev->cost_[0] + arc_clg.weight.Value();
+        cost_[0] = prev->cost_[0] + arc_hcl.weight.Value();
         cost_[1] = prev->cost_[1] + arc_lm1.weight.Value();
         cost_[2] = prev->cost_[2] + arc_lm2.weight.Value();
         cost_[3] = prev->cost_[3] + ac_cost;
       } else {
-        cost_[0] = arc_clg.weight.Value();
+        cost_[0] = arc_hcl.weight.Value();
         cost_[1] = arc_lm1.weight.Value();
         cost_[2] = arc_lm2.weight.Value();
         cost_[3] = ac_cost;
       }
     }
-    inline Token(const Arc &arc_clg, const Arc &arc_lm1, const Arc &arc_lm2,
+    inline Token(const Arc &arc_hcl, const Arc &arc_lm1, const Arc &arc_lm2,
                  Token *prev):
-        state_(arc_clg.nextstate, arc_lm1.nextstate, arc_lm2.nextstate),
-        ilabel_(arc_clg.ilabel), olabel_(arc_lm1.olabel), prev_(prev), ref_count_(1) {
+        state_(arc_hcl.nextstate, arc_lm1.nextstate, arc_lm2.nextstate),
+        ilabel_(arc_hcl.ilabel), olabel_(arc_lm1.olabel), prev_(prev), ref_count_(1) {
 #ifdef KALDI_PARANOID
       KALDI_ASSERT(arc_lm1.olabel == arc_lm2.olabel);
 #endif
       if (prev) {
         prev->ref_count_++;
-        cost_[0] = prev->cost_[0] + arc_clg.weight.Value();
+        cost_[0] = prev->cost_[0] + arc_hcl.weight.Value();
         cost_[1] = prev->cost_[1] + arc_lm1.weight.Value();
         cost_[2] = prev->cost_[2] + arc_lm2.weight.Value();
         cost_[3] = prev->cost_[3];
       } else {
-        cost_[0] = arc_clg.weight.Value();
+        cost_[0] = arc_hcl.weight.Value();
         cost_[1] = arc_lm1.weight.Value();
         cost_[2] = arc_lm2.weight.Value();
         cost_[3] = 0.0;
@@ -185,6 +185,22 @@ class FasterDecoderInterpLm {
 
     inline BaseFloat TotalCost() const {
       return cost_[0] - kaldi::LogAdd(-cost_[1], -cost_[2]) + cost_[3];
+    }
+
+    inline BaseFloat TotalFinalCost(
+        const fst::Fst<fst::StdArc>& hcl,
+        const fst::DeterministicOnDemandFst<fst::StdArc>& lm1,
+        const fst::DeterministicOnDemandFst<fst::StdArc>& lm2) const {
+      const BaseFloat infinity = std::numeric_limits<BaseFloat>::infinity();
+      const BaseFloat f_hcl =
+          state_[0] != fst::kNoStateId ? hcl.Final(state_[0]).Value() : infinity;
+      const BaseFloat f_lm1 =
+          state_[1] != fst::kNoStateId ? hcl.Final(state_[1]).Value() : infinity;
+      const BaseFloat f_lm2 =
+          state_[2] != fst::kNoStateId ? hcl.Final(state_[2]).Value() : infinity;
+      return (cost_[0] + f_hcl)                                   // Cost through HCL
+          - kaldi::LogAdd(-cost_[1] - f_lm1, -cost_[2] - f_lm2)   // Cost through LM
+          + cost_[3];                                             // Acoustic cost
     }
 
     inline bool operator < (const Token &other) {
@@ -223,8 +239,6 @@ class FasterDecoderInterpLm {
   // Find arcs from the current state in each LM with the given label.
   void FindLmArcs(StateId state_lm1, StateId state_lm2, Label label,
                   Arc *arc_lm1, Arc *arc_lm2);
-
-  BaseFloat FinalLmCost(StateId state_lm1, StateId state_lm2) const;
 
   // HashList defined in ../util/hash-list.h.  It actually allows us to maintain
   // more than one list (e.g. for current and previous frames), but only one of
