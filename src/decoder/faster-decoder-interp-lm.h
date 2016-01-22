@@ -29,6 +29,38 @@
 
 namespace kaldi {
 
+struct FasterDecoderInterpLmOptions {
+  BaseFloat beam;
+  int32 max_active;
+  int32 min_active;
+  BaseFloat beam_delta;
+  BaseFloat hash_ratio;
+  BaseFloat interp_weight;
+  FasterDecoderInterpLmOptions(): beam(16.0),
+                                  max_active(std::numeric_limits<int32>::max()),
+                                  min_active(20), // This decoder mostly used for
+                                                  // alignment, use small default.
+                                  beam_delta(0.5),
+                                  hash_ratio(2.0),
+                                  interp_weight(0.5) { }
+  void Register(OptionsItf *opts, bool full) {  /// if "full", use obscure
+    /// options too.
+    /// Depends on program.
+    opts->Register("beam", &beam, "Decoder beam");
+    opts->Register("max-active", &max_active, "Decoder max active states.");
+    opts->Register("min-active", &min_active,
+                   "Decoder min active states (don't prune if #active less than this).");
+    opts->Register("interp-weight", &interp_weight,
+                   "Interpolation weight for the first language model (0 <= weight <= 1).");
+    if (full) {
+      opts->Register("beam-delta", &beam_delta,
+                     "Increment used in decoder [obscure setting]");
+      opts->Register("hash-ratio", &hash_ratio,
+                     "Setting used in decoder to control hash behavior");
+    }
+  }
+};
+
 class FasterDecoderInterpLm {
  public:
   typedef fst::StdArc Arc;
@@ -37,11 +69,11 @@ class FasterDecoderInterpLm {
   typedef Arc::Weight Weight;
 
   FasterDecoderInterpLm(const fst::Fst<fst::StdArc> &fst,
-                        fst::DeterministicOnDemandFst &lm1,
-                        fst::DeterministicOnDemandFst &lm2,
-                        const FasterDecoderOptions &config);
+                        fst::DeterministicOnDemandFst<fst::StdArc> &lm1,
+                        fst::DeterministicOnDemandFst<fst::StdArc> &lm2,
+                        const FasterDecoderInterpLmOptions &config);
 
-  void SetOptions(const FasterDecoderOptions &config) { config_ = config; }
+  void SetOptions(const FasterDecoderInterpLmOptions &config) { config_ = config; }
 
   ~FasterDecoderInterpLm() { ClearToks(toks_.Clear()); }
 
@@ -75,10 +107,35 @@ class FasterDecoderInterpLm {
 
  protected:
 
+  // Struct used to represent a state
+  struct StateTriplet {
+    StateId state[3];
+    StateTriplet() {
+      state[0] = state[1] = state[2] = fst::kNoStateId;
+    }
+    StateTriplet(StateId state0, StateId state1, StateId state2) {
+      state[0] = state0;
+      state[1] = state1;
+      state[2] = state2;
+    }
+
+    // Support for static_cast<size_t>(StateTriplet()), used by HashList
+    operator size_t() {
+      return static_cast<size_t>(state[0] ^ state[1] ^ state[2]);
+    }
+    // Shortcut for state.state[i]
+    StateId operator[](const size_t i) const {
+#ifdef KALDI_PARANOID
+      KALDI_ASSERT(i < 3);
+#endif
+      return state[i];
+    }
+  };
+
   class Token {
    public:
-    StateId state_[3];
-    BaseFloat cost_[3];
+    StateTriplet state_;
+    BaseFloat cost_[4];
     Label ilabel_;
     Label olabel_;
     // we can work out the acoustic part from difference between
@@ -87,49 +144,47 @@ class FasterDecoderInterpLm {
     int32 ref_count_;
     inline Token(const Arc &arc_clg, const Arc &arc_lm1, const Arc &arc_lm2,
                  BaseFloat ac_cost, Token *prev):
-        ilabel_(arc_clg.ilabel), olabel_(arc_lm1.olabel),
-        prev_(prev), ref_count_(1) {
+        state_(arc_clg.nextstate, arc_lm1.nextstate, arc_lm2.nextstate),
+        ilabel_(arc_clg.ilabel), olabel_(arc_lm1.olabel), prev_(prev), ref_count_(1) {
 #ifdef KALDI_PARANOID
       KALDI_ASSERT(arc_lm1.olabel == arc_lm2.olabel);
 #endif
-      state_[0] = arc_clg.nextstate;
-      state_[1] = arc_lm1.nextstate;
-      state_[2] = arc_lm2.nextstate;
-      if (prev) {
-        prev->ref_count_++;
-        cost_[0] = prev->cost_[0] + arc_clg.weight.Value() + ac_cost;
-        cost_[1] = prev->cost_[1] + arc_lm1.weight.Value();
-        cost_[2] = prev->cost_[2] + arc_lm2.weight.Value();
-      } else {
-        cost_[0] = arc_clg.weight.Value() + ac_cost;
-        cost_[1] = arc_lm1.weight.Value();
-        cost_[2] = arc_lm2.weight.Value();
-      }
-    }
-    inline Token(const Arc &arc_clg, const Arc &arc_lm1, const Arc &arc_lm2,
-                 Token *prev):
-        ilabel_(arc_clg.ilabel), olabel_(arc_lm1.olabel),
-        prev_(prev), ref_count_(1) {
-#ifdef KALDI_PARANOID
-      KALDI_ASSERT(arc_lm1.olabel == arc_lm2.olabel);
-#endif
-      state_[0] = arc_clg.nextstate;
-      state_[1] = arc_lm1.nextstate;
-      state_[2] = arc_lm2.nextstate;
       if (prev) {
         prev->ref_count_++;
         cost_[0] = prev->cost_[0] + arc_clg.weight.Value();
         cost_[1] = prev->cost_[1] + arc_lm1.weight.Value();
         cost_[2] = prev->cost_[2] + arc_lm2.weight.Value();
+        cost_[3] = prev->cost_[3] + ac_cost;
       } else {
         cost_[0] = arc_clg.weight.Value();
         cost_[1] = arc_lm1.weight.Value();
         cost_[2] = arc_lm2.weight.Value();
+        cost_[3] = ac_cost;
+      }
+    }
+    inline Token(const Arc &arc_clg, const Arc &arc_lm1, const Arc &arc_lm2,
+                 Token *prev):
+        state_(arc_clg.nextstate, arc_lm1.nextstate, arc_lm2.nextstate),
+        ilabel_(arc_clg.ilabel), olabel_(arc_lm1.olabel), prev_(prev), ref_count_(1) {
+#ifdef KALDI_PARANOID
+      KALDI_ASSERT(arc_lm1.olabel == arc_lm2.olabel);
+#endif
+      if (prev) {
+        prev->ref_count_++;
+        cost_[0] = prev->cost_[0] + arc_clg.weight.Value();
+        cost_[1] = prev->cost_[1] + arc_lm1.weight.Value();
+        cost_[2] = prev->cost_[2] + arc_lm2.weight.Value();
+        cost_[3] = prev->cost_[3];
+      } else {
+        cost_[0] = arc_clg.weight.Value();
+        cost_[1] = arc_lm1.weight.Value();
+        cost_[2] = arc_lm2.weight.Value();
+        cost_[3] = 0.0;
       }
     }
 
     inline BaseFloat TotalCost() const {
-      return cost_[0] - kaldi::LogAdd(-cost[1], -cost[2]);
+      return cost_[0] - kaldi::LogAdd(-cost_[1], -cost_[2]) + cost_[3];
     }
 
     inline bool operator < (const Token &other) {
@@ -148,7 +203,7 @@ class FasterDecoderInterpLm {
 #endif
     }
   };
-  typedef HashList<StateId, Token*>::Elem Elem;
+  typedef HashList<StateTriplet, Token*>::Elem Elem;
 
 
   /// Gets the weight cutoff.  Also counts the active tokens.
@@ -165,15 +220,21 @@ class FasterDecoderInterpLm {
   // TODO: first time we go through this, could avoid using the queue.
   void ProcessNonemitting(double cutoff);
 
+  // Find arcs from the current state in each LM with the given label.
+  void FindLmArcs(StateId state_lm1, StateId state_lm2, Label label,
+                  Arc *arc_lm1, Arc *arc_lm2);
+
+  BaseFloat FinalLmCost(StateId state_lm1, StateId state_lm2) const;
+
   // HashList defined in ../util/hash-list.h.  It actually allows us to maintain
   // more than one list (e.g. for current and previous frames), but only one of
   // them at a time can be indexed by StateId.
-  HashList<StateId, Token*> toks_;
-  const fst::Fst<fst::StdArc> &fst_;
-  fst::DeterministicOnDemandFst &lm1_;
-  fst::DeterministicOnDemandFst &lm2_;
-  FasterDecoderOptions config_;
-  std::vector<StateId> queue_;  // temp variable used in ProcessNonemitting,
+  HashList<StateTriplet, Token*> toks_;
+  const fst::Fst<fst::StdArc> &hcl_;
+  fst::DeterministicOnDemandFst<fst::StdArc> &lm1_;
+  fst::DeterministicOnDemandFst<fst::StdArc> &lm2_;
+  FasterDecoderInterpLmOptions config_;
+  std::vector<StateTriplet> queue_;  // temp variable used in ProcessNonemitting,
   std::vector<BaseFloat> tmp_array_;  // used in GetCutoff.
   // make it class member to avoid internal new/delete.
 

@@ -22,40 +22,46 @@
 namespace kaldi {
 
 FasterDecoderInterpLm::FasterDecoderInterpLm(
-    const fst::Fst<fst::StdArc> &fst,
-    kaldi::DeterministicOnDemandFst &lm1,
-    kaldi::DeterministicOnDemandFst &lm2,
-    const FasterDecoderOptions &config) :
-    fst_(fst), lm1_(lm1), lm2_(lm2), config_(opts), num_frames_decoded_(-1) {
+    const fst::Fst<fst::StdArc> &hcl,
+    fst::DeterministicOnDemandFst<fst::StdArc> &lm1,
+    fst::DeterministicOnDemandFst<fst::StdArc> &lm2,
+    const FasterDecoderInterpLmOptions &config) :
+    hcl_(hcl), lm1_(lm1), lm2_(lm2), config_(config), num_frames_decoded_(-1) {
   KALDI_ASSERT(config_.hash_ratio >= 1.0);  // less doesn't make much sense.
   KALDI_ASSERT(config_.max_active > 1);
   KALDI_ASSERT(config_.min_active >= 0 && config_.min_active < config_.max_active);
+  KALDI_ASSERT(config_.interp_weight >= 0.0 && config_.interp_weight <= 1.0);
   toks_.SetSize(1000);  // just so on the first frame we do something reasonable.
 }
 
 
-void FasterDecoder::InitDecoding() {
+void FasterDecoderInterpLm::InitDecoding() {
   // clean up from last time:
   ClearToks(toks_.Clear());
-  StateId start_state = fst_.Start();
-  KALDI_ASSERT(start_state != fst::kNoStateId);
-  Arc dummy_arc(0, 0, Weight::One(), start_state);
-  toks_.Insert(start_state, new Token(dummy_arc, NULL));
+  KALDI_ASSERT(hcl_.Start() != fst::kNoStateId);
+  KALDI_ASSERT(lm1_.Start() != fst::kNoStateId);
+  KALDI_ASSERT(lm2_.Start() != fst::kNoStateId);
+  StateTriplet start_state(hcl_.Start(), lm1_.Start(), lm2_.Start());
+  const BaseFloat cost_lm1 = -log(config_.interp_weight);
+  const BaseFloat cost_lm2 = -log(1.0 - config_.interp_weight);
+  toks_.Insert(start_state, new Token(Arc(0, 0, Weight::One(), hcl_.Start()),
+                                      Arc(0, 0, cost_lm1, lm1_.Start()),
+                                      Arc(0, 0, cost_lm2, lm1_.Start()), NULL));
   ProcessNonemitting(std::numeric_limits<float>::max());
   num_frames_decoded_ = 0;
 }
 
 
-void FasterDecoder::Decode(DecodableInterface *decodable) {
+void FasterDecoderInterpLm::Decode(DecodableInterface *decodable) {
   InitDecoding();
   while (!decodable->IsLastFrame(num_frames_decoded_ - 1)) {
-    double weight_cutoff = ProcessEmitting(decodable);
+    const double weight_cutoff = ProcessEmitting(decodable);
     ProcessNonemitting(weight_cutoff);
   }
 }
 
-void FasterDecoder::AdvanceDecoding(DecodableInterface *decodable,
-                                      int32 max_num_frames) {
+void FasterDecoderInterpLm::AdvanceDecoding(DecodableInterface *decodable,
+                                            int32 max_num_frames) {
   KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                "You must call InitDecoding() before AdvanceDecoding()");
   int32 num_frames_ready = decodable->NumFramesReady();
@@ -70,23 +76,25 @@ void FasterDecoder::AdvanceDecoding(DecodableInterface *decodable,
                                      num_frames_decoded_ + max_num_frames);
   while (num_frames_decoded_ < target_frames_decoded) {
     // note: ProcessEmitting() increments num_frames_decoded_
-    double weight_cutoff = ProcessEmitting(decodable);
+    const double weight_cutoff = ProcessEmitting(decodable);
     ProcessNonemitting(weight_cutoff);
   }
 }
 
 
-bool FasterDecoder::ReachedFinal() {
+bool FasterDecoderInterpLm::ReachedFinal() {
   for (const Elem *e = toks_.GetList(); e != NULL; e = e->tail) {
-    if (e->val->cost_ != std::numeric_limits<double>::infinity() &&
-        fst_.Final(e->key) != Weight::Zero())
+    StateTriplet state = e->key;
+    if (e->val->TotalCost() != std::numeric_limits<double>::infinity() &&
+        hcl_.Final(state[0]) != Weight::Zero() &&
+        FinalLmCost(state[1], state[2]) != std::numeric_limits<double>::infinity())
       return true;
   }
   return false;
 }
 
-bool FasterDecoder::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
-                                bool use_final_probs) {
+bool FasterDecoderInterpLm::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
+                                        bool use_final_probs) {
   // GetBestPath gets the decoding output.  If "use_final_probs" is true
   // AND we reached a final state, it limits itself to final states;
   // otherwise it gets the most likely token not taking into
@@ -95,16 +103,18 @@ bool FasterDecoder::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
   // will be nonempty).
   fst_out->DeleteStates();
   Token *best_tok = NULL;
-  bool is_final = ReachedFinal();
+  const bool is_final = ReachedFinal();
   if (!is_final) {
     for (const Elem *e = toks_.GetList(); e != NULL; e = e->tail)
       if (best_tok == NULL || *best_tok < *(e->val) )
         best_tok = e->val;
   } else {
-    double infinity =  std::numeric_limits<double>::infinity(),
-        best_cost = infinity;
+    const double infinity =  std::numeric_limits<double>::infinity();
+    double best_cost = infinity;
     for (const Elem *e = toks_.GetList(); e != NULL; e = e->tail) {
-      double this_cost = e->val->cost_ + fst_.Final(e->key).Value();
+      const StateTriplet state = e->key;
+      const double this_cost = e->val->TotalCost() + hcl_.Final(state[0]).Value() +
+          FinalLmCost(state[1], state[2]);
       if (this_cost < best_cost && this_cost != infinity) {
         best_cost = this_cost;
         best_tok = e->val;
@@ -116,17 +126,16 @@ bool FasterDecoder::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
   std::vector<LatticeArc> arcs_reverse;  // arcs in reverse order.
 
   for (Token *tok = best_tok; tok != NULL; tok = tok->prev_) {
-    BaseFloat tot_cost = tok->cost_ -
-        (tok->prev_ ? tok->prev_->cost_ : 0.0),
-        graph_cost = tok->arc_.weight.Value(),
-        ac_cost = tot_cost - graph_cost;
-    LatticeArc l_arc(tok->arc_.ilabel,
-                     tok->arc_.olabel,
+    const double tot_cost = tok->TotalCost() - (tok->prev_ ? tok->prev_->TotalCost() : 0.0);
+    const double ac_cost = tok->cost_[3] - (tok->prev_ ? tok->prev_->cost_[3] : 0.0);
+    const double graph_cost = tot_cost - ac_cost;
+    LatticeArc l_arc(tok->ilabel_,
+                     tok->olabel_,
                      LatticeWeight(graph_cost, ac_cost),
-                     tok->arc_.nextstate);
+                     tok->state_[0]);
     arcs_reverse.push_back(l_arc);
   }
-  KALDI_ASSERT(arcs_reverse.back().nextstate == fst_.Start());
+  KALDI_ASSERT(arcs_reverse.back().nextstate == hcl_.Start());
   arcs_reverse.pop_back();  // that was a "fake" token... gives no info.
 
   StateId cur_state = fst_out->AddState();
@@ -138,8 +147,9 @@ bool FasterDecoder::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
     cur_state = arc.nextstate;
   }
   if (is_final && use_final_probs) {
-    Weight final_weight = fst_.Final(best_tok->arc_.nextstate);
-    fst_out->SetFinal(cur_state, LatticeWeight(final_weight.Value(), 0.0));
+    const BaseFloat final_weight = hcl_.Final(best_tok->state_[0]).Value() +
+        FinalLmCost(best_tok->state_[1], best_tok->state_[2]);
+    fst_out->SetFinal(cur_state, LatticeWeight(final_weight, 0.0));
   } else {
     fst_out->SetFinal(cur_state, LatticeWeight::One());
   }
@@ -149,14 +159,14 @@ bool FasterDecoder::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
 
 
 // Gets the weight cutoff.  Also counts the active tokens.
-double FasterDecoder::GetCutoff(Elem *list_head, size_t *tok_count,
-                                BaseFloat *adaptive_beam, Elem **best_elem) {
+double FasterDecoderInterpLm::GetCutoff(Elem *list_head, size_t *tok_count,
+                                        BaseFloat *adaptive_beam, Elem **best_elem) {
   double best_cost = std::numeric_limits<double>::infinity();
   size_t count = 0;
   if (config_.max_active == std::numeric_limits<int32>::max() &&
       config_.min_active == 0) {
     for (Elem *e = list_head; e != NULL; e = e->tail, count++) {
-      double w = e->val->cost_;
+      const double w = e->val->TotalCost();
       if (w < best_cost) {
         best_cost = w;
         if (best_elem) *best_elem = e;
@@ -168,7 +178,7 @@ double FasterDecoder::GetCutoff(Elem *list_head, size_t *tok_count,
   } else {
     tmp_array_.clear();
     for (Elem *e = list_head; e != NULL; e = e->tail, count++) {
-      double w = e->val->cost_;
+      double w = e->val->TotalCost();
       tmp_array_.push_back(w);
       if (w < best_cost) {
         best_cost = w;
@@ -213,7 +223,7 @@ double FasterDecoder::GetCutoff(Elem *list_head, size_t *tok_count,
   }
 }
 
-void FasterDecoder::PossiblyResizeHash(size_t num_toks) {
+void FasterDecoderInterpLm::PossiblyResizeHash(size_t num_toks) {
   size_t new_sz = static_cast<size_t>(static_cast<BaseFloat>(num_toks)
                                       * config_.hash_ratio);
   if (new_sz > toks_.Size()) {
@@ -222,7 +232,7 @@ void FasterDecoder::PossiblyResizeHash(size_t num_toks) {
 }
 
 // ProcessEmitting returns the likelihood cutoff used.
-double FasterDecoder::ProcessEmitting(DecodableInterface *decodable) {
+double FasterDecoderInterpLm::ProcessEmitting(DecodableInterface *decodable) {
   int32 frame = num_frames_decoded_;
   Elem *last_toks = toks_.Clear();
   size_t tok_cnt;
@@ -241,15 +251,24 @@ double FasterDecoder::ProcessEmitting(DecodableInterface *decodable) {
   // First process the best token to get a hopefully
   // reasonably tight bound on the next cutoff.
   if (best_elem) {
-    StateId state = best_elem->key;
+    StateTriplet state = best_elem->key;
     Token *tok = best_elem->val;
-    for (fst::ArcIterator<fst::Fst<Arc> > aiter(fst_, state);
+    for (fst::ArcIterator<fst::Fst<Arc> > aiter(hcl_, state[0]);
          !aiter.Done();
          aiter.Next()) {
       const Arc &arc = aiter.Value();
       if (arc.ilabel != 0) {  // we'd propagate..
-        BaseFloat ac_cost = - decodable->LogLikelihood(frame, arc.ilabel);
-        double new_weight = arc.weight.Value() + tok->cost_ + ac_cost;
+        const BaseFloat ac_cost = - decodable->LogLikelihood(frame, arc.ilabel);
+        // Find arcs through the LMs
+        Arc arc_lm1, arc_lm2;
+        FindLmArcs(tok->state_[1], tok->state_[2], arc.olabel, &arc_lm1, &arc_lm2);
+        // We have to linearly interpolate the weights between the two LMs and add that
+        // cost to the token only when a output symbol is emitted in the HCL FST.
+        const double new_weight =
+            (tok->cost_[0] + arc.weight.Value() + ac_cost)                 // HCL cost
+            - kaldi::LogAdd(- tok->cost_[1] - arc_lm1.weight.Value(),      // Int. LM cost
+                            - tok->cost_[2] - arc_lm2.weight.Value());
+
         if (new_weight + adaptive_beam < next_weight_cutoff)
           next_weight_cutoff = new_weight + adaptive_beam;
       }
@@ -264,25 +283,32 @@ double FasterDecoder::ProcessEmitting(DecodableInterface *decodable) {
   for (Elem *e = last_toks, *e_tail; e != NULL; e = e_tail) {  // loop this way
     // n++;
     // because we delete "e" as we go.
-    StateId state = e->key;
+    StateTriplet state = e->key;
     Token *tok = e->val;
-    if (tok->cost_ < weight_cutoff) {  // not pruned.
+    if (tok->TotalCost() < weight_cutoff) {  // not pruned.
       // np++;
-      KALDI_ASSERT(state == tok->arc_.nextstate);
-      for (fst::ArcIterator<fst::Fst<Arc> > aiter(fst_, state);
-           !aiter.Done();
-           aiter.Next()) {
+      for (fst::ArcIterator<fst::Fst<Arc> > aiter(hcl_, state[0]);
+           !aiter.Done(); aiter.Next()) {
         Arc arc = aiter.Value();
         if (arc.ilabel != 0) {  // propagate..
           BaseFloat ac_cost =  - decodable->LogLikelihood(frame, arc.ilabel);
-          double new_weight = arc.weight.Value() + tok->cost_ + ac_cost;
+          // Find arcs through the LMs
+          Arc arc_lm1, arc_lm2;
+          FindLmArcs(tok->state_[1], tok->state_[2], arc.olabel, &arc_lm1, &arc_lm2);
+          // We have to linearly interpolate the weights between the two LMs and add that
+          // cost to the token only when a output symbol is emitted in the HCL FST.
+          const double new_weight =
+              (tok->cost_[0] + arc.weight.Value() + ac_cost)                 // HCL cost
+              - kaldi::LogAdd(- tok->cost_[1] - arc_lm1.weight.Value(),      // Int. LM cost
+                              - tok->cost_[2] - arc_lm2.weight.Value());
+
           if (new_weight < next_weight_cutoff) {  // not pruned..
-            Token *new_tok = new Token(arc, ac_cost, tok);
-            Elem *e_found = toks_.Find(arc.nextstate);
+            Token *new_tok = new Token(arc, arc_lm1, arc_lm2, ac_cost, tok);
+            Elem *e_found = toks_.Find(new_tok->state_);
             if (new_weight + adaptive_beam < next_weight_cutoff)
               next_weight_cutoff = new_weight + adaptive_beam;
             if (e_found == NULL) {
-              toks_.Insert(arc.nextstate, new_tok);
+              toks_.Insert(new_tok->state_, new_tok);
             } else {
               if ( *(e_found->val) < *new_tok ) {
                 Token::TokenDelete(e_found->val);
@@ -304,38 +330,39 @@ double FasterDecoder::ProcessEmitting(DecodableInterface *decodable) {
 }
 
 // TODO: first time we go through this, could avoid using the queue.
-void FasterDecoder::ProcessNonemitting(double cutoff) {
+void FasterDecoderInterpLm::ProcessNonemitting(double cutoff) {
   // Processes nonemitting arcs for one frame.
   KALDI_ASSERT(queue_.empty());
   for (const Elem *e = toks_.GetList(); e != NULL;  e = e->tail)
     queue_.push_back(e->key);
   while (!queue_.empty()) {
-    StateId state = queue_.back();
+    StateTriplet state = queue_.back();
     queue_.pop_back();
     Token *tok = toks_.Find(state)->val;  // would segfault if state not
     // in toks_ but this can't happen.
-    if (tok->cost_ > cutoff) { // Don't bother processing successors.
+    if (tok->TotalCost() > cutoff) { // Don't bother processing successors.
       continue;
     }
-    KALDI_ASSERT(tok != NULL && state == tok->arc_.nextstate);
-    for (fst::ArcIterator<fst::Fst<Arc> > aiter(fst_, state);
-         !aiter.Done();
+    KALDI_ASSERT(tok != NULL && state == tok->state_);
+    for (fst::ArcIterator<fst::Fst<Arc> > aiter(hcl_, state[0]); !aiter.Done();
          aiter.Next()) {
       const Arc &arc = aiter.Value();
       if (arc.ilabel == 0) {  // propagate nonemitting only...
-        Token *new_tok = new Token(arc, tok);
-        if (new_tok->cost_ > cutoff) {  // prune
+        Arc arc_lm1, arc_lm2;
+        FindLmArcs(tok->state_[1], tok->state_[2], arc.olabel, &arc_lm1, &arc_lm2);
+        Token *new_tok = new Token(arc, arc_lm1, arc_lm2, tok);
+        if (new_tok->TotalCost() > cutoff) {  // prune
           Token::TokenDelete(new_tok);
         } else {
-          Elem *e_found = toks_.Find(arc.nextstate);
+          Elem *e_found = toks_.Find(new_tok->state_);
           if (e_found == NULL) {
-            toks_.Insert(arc.nextstate, new_tok);
-            queue_.push_back(arc.nextstate);
+            toks_.Insert(new_tok->state_, new_tok);
+            queue_.push_back(new_tok->state_);
           } else {
             if ( *(e_found->val) < *new_tok ) {
               Token::TokenDelete(e_found->val);
               e_found->val = new_tok;
-              queue_.push_back(arc.nextstate);
+              queue_.push_back(new_tok->state_);
             } else {
               Token::TokenDelete(new_tok);
             }
@@ -346,12 +373,45 @@ void FasterDecoder::ProcessNonemitting(double cutoff) {
   }
 }
 
-void FasterDecoder::ClearToks(Elem *list) {
+void FasterDecoderInterpLm::ClearToks(Elem *list) {
   for (Elem *e = list, *e_tail; e != NULL; e = e_tail) {
     Token::TokenDelete(e->val);
     e_tail = e->tail;
     toks_.Delete(e);
   }
+}
+
+void FasterDecoderInterpLm::FindLmArcs(StateId state_lm1, StateId state_lm2, Label label,
+                                       Arc *arc_lm1, Arc *arc_lm2) {
+  KALDI_ASSERT(arc_lm1 != NULL & arc_lm2 != NULL);
+  if (label == 0) {
+    // If no symbol is emitted, we do not change the state in the LMs, which is just
+    // like having a loop arc in the current state of each LM with zero cost.
+    arc_lm1->ilabel = arc_lm1->olabel = arc_lm2->ilabel = arc_lm2->olabel = 0;
+    arc_lm1->weight = arc_lm2->weight = Weight::One();
+    arc_lm1->nextstate = state_lm1;
+    arc_lm2->nextstate = state_lm2;
+  } else {
+    // Try to go through an arc labeled with `label', from the current state in both LM.
+    // If no arc is found with `label', then go to a terminal state with infinity cost for
+    // that LM.
+    if (state_lm1 == fst::kNoStateId || !lm1_.GetArc(state_lm1, label, arc_lm1)) {
+      arc_lm1->ilabel = arc_lm1->olabel = label;
+      arc_lm1->weight = Weight::Zero();
+      arc_lm1->nextstate = fst::kNoStateId;
+    }
+    if (state_lm2 == fst::kNoStateId || !lm2_.GetArc(state_lm2, label, arc_lm2)) {
+      arc_lm2->ilabel = arc_lm2->olabel = label;
+      arc_lm2->weight = Weight::Zero();
+      arc_lm2->nextstate = fst::kNoStateId;
+    }
+  }
+}
+
+BaseFloat FasterDecoderInterpLm::FinalLmCost(StateId state_lm1, StateId state_lm2) const {
+  const Weight w1 = state_lm1 == fst::kNoStateId ? Weight::Zero() : lm1_.Final(state_lm1);
+  const Weight w2 = state_lm2 == fst::kNoStateId ? Weight::Zero() : lm2_.Final(state_lm2);
+  return -kaldi::LogAdd(-w1.Value(), -w2.Value());
 }
 
 } // end namespace kaldi.
