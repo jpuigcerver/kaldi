@@ -15,16 +15,17 @@ BINFILES = fstdeterminizestar  \
            fstmakecontextsyms fstaddsubsequentialloop fstaddselfloops  \
            fstrmepslocal fstcomposecontext fsttablecompose fstrand fstfactor \
            fstdeterminizelog fstphicompose fstrhocompose fstpropfinal fstcopy \
-	       fstpushspecial fsts-to-transcripts
+           fstpushspecial fsts-to-transcripts fstlinearinterp
 
-OBJFILES = 
 
-TESTFILES = 
+OBJFILES =
+
+TESTFILES =
 
 # actually, this library is currently empty.  Everything is a header.
-LIBFILE = 
+LIBFILE =
 
 ADDLIBS = ../fstext/kaldi-fstext.a ../matrix/kaldi-matrix.a ../base/kaldi-base.a \
-          ../util/kaldi-util.a 
+          ../util/kaldi-util.a
 
 include ../makefiles/default_rules.mk
