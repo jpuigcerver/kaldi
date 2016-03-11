@@ -964,19 +964,19 @@ static BaseFloat GetScaledTransitionLogProb(const TransitionModel &trans_model,
 }
 
 
-
+template <class F>
 void AddTransitionProbs(const TransitionModel &trans_model,
                         const std::vector<int32> &disambig_syms,  // may be empty
                         BaseFloat transition_scale,
                         BaseFloat self_loop_scale,
-                        fst::VectorFst<fst::StdArc> *fst) {
+                        F *fst) {
   using namespace fst;
   KALDI_ASSERT(IsSortedAndUniq(disambig_syms));
   int num_tids = trans_model.NumTransitionIds();
-  for (StateIterator<VectorFst<StdArc> > siter(*fst);
+  for (StateIterator<F> siter(*fst);
       !siter.Done();
       siter.Next()) {
-    for (MutableArcIterator<VectorFst<StdArc> > aiter(fst, siter.Value());
+    for (MutableArcIterator<F> aiter(fst, siter.Value());
          !aiter.Done();
          aiter.Next()) {
       StdArc arc = aiter.Value();
@@ -1083,6 +1083,20 @@ bool ConvertPhnxToProns(const std::vector<int32> &phnx,
   return (j == words.size());
 }
 
+/// Specialization of AddTransitionProbs for VectorFst and ForwardBackwardFst
+template void AddTransitionProbs< fst::VectorFst<fst::StdArc> >(
+    const TransitionModel &trans_model,
+    const std::vector<int32> &disambig_syms,
+    BaseFloat transition_scale,
+    BaseFloat self_loop_scale,
+    fst::VectorFst<fst::StdArc>* fst);
+
+template void AddTransitionProbs< fst::ForwardBackwardFst<fst::StdArc> >(
+    const TransitionModel &trans_model,
+    const std::vector<int32> &disambig_syms,
+    BaseFloat transition_scale,
+    BaseFloat self_loop_scale,
+    fst::ForwardBackwardFst<fst::StdArc>* fst);
 
 void GetRandomAlignmentForPhone(const ContextDependencyInterface &ctx_dep,
                                 const TransitionModel &trans_model,

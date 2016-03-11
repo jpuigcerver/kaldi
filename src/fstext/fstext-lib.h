@@ -23,6 +23,7 @@
 #include "fstext/context-fst.h"
 #include "fstext/determinize-star.h"
 #include "fstext/factor.h"
+#include "fstext/forward-backward-fst.h"
 #include "fstext/fst-test-utils.h"
 #include "fstext/fstext-utils.h"
 #include "fstext/pre-determinize.h"

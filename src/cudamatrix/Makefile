@@ -27,7 +27,6 @@ LIBNAME = kaldi-cudamatrix
 
 all:  $(LIBFILE)
 
-
 ifeq ($(CUDA), true)
   #Default compute capability architectures we compile with
   CUDA_ARCH=-gencode arch=compute_20,code=sm_20
@@ -65,4 +64,3 @@ endif
 ADDLIBS = ../matrix/kaldi-matrix.a ../base/kaldi-base.a  ../util/kaldi-util.a
 
 include ../makefiles/default_rules.mk
-
