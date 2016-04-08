@@ -89,6 +89,8 @@ int main(int argc, char *argv[]) {
     }
     KALDI_ASSERT(alpha1 >= 0.0 && alpha1 <= 1.0);
     BaseFloat alpha2 = 1.0 - alpha1;
+    if (alpha2 == 0.0) { alpha1 = 1.0; }
+    else if (alpha2 == 1.0) { alpha1 = 0.0; }
 
     std::string fsts_rspecifier1 = po.GetArg(1),
         fsts_rspecifier2 = po.GetArg(2),

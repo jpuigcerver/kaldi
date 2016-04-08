@@ -147,7 +147,14 @@ int main(int argc, char *argv[]) {
       po.PrintUsage();
       exit(1);
     }
-    KALDI_ASSERT(alpha > 0.0 && alpha < 1.0);
+    // Avoid numerical problems with 1.0 - alpha
+    if (alpha < std::numeric_limits<float>::epsilon()) {
+      alpha = 0.0f;
+      KALDI_WARN << "--alpha is approximately 0.0";
+    } else if (alpha > (1.0f - std::numeric_limits<float>::epsilon())) {
+      alpha = 1.0f;
+      KALDI_WARN << "--alpha is approximately 1.0";
+    }
 
     std::vector<std::vector<double> > scale1(2);
     scale1[0].resize(2);
@@ -180,7 +187,7 @@ int main(int argc, char *argv[]) {
       // Read first compact lattice, convert it to the custom format and
       // linearly scale with alpha.
       fst::CustomCompactLattice cclat1;
-      {
+      if (alpha > 0.0) {
         CompactLattice temp = lattice_reader1.Value();
         lattice_reader1.FreeCurrent();
         fst::ScaleLattice(scale1, &temp);
@@ -195,7 +202,7 @@ int main(int argc, char *argv[]) {
         // Read second compact lattice, convert it to the custom format and
         // linearly scale it with 1.0 - alpha.
         fst::CustomCompactLattice cclat2;
-        {
+        if (alpha < 1.0) {
           CompactLattice temp = lattice_reader2.Value(key);
           fst::ScaleLattice(scale2, &temp);
           ConvertLattice(temp, &cclat2);
@@ -207,17 +214,28 @@ int main(int argc, char *argv[]) {
         // to create the linearly interpolated lattice. Optionally, also
         // minimizes the output lattice.
         CompactLattice lat3;
-        {
-          fst::CustomCompactLattice temp, temp2;
+        fst::CustomCompactLattice temp, temp2;
+        if (alpha > 0.0 && alpha < 1.0) {
           fst::Determinize(
               fst::UnionFst<fst::CustomCompactLatticeArc>(cclat1, cclat2),
               &temp);
           if (minimize) {
             fst::Minimize(&temp, &temp2);
           }
-          ConvertLattice(temp2, &lat3);
+        } else if (alpha > 0.0) {
+          // alpha is approximately 1.0
+          fst::Determinize(cclat1, &temp);
+          if (minimize) {
+            fst::Minimize(&temp, &temp2);
+          }
+        } else {
+          // alpha is approximately 0.0
+          fst::Determinize(cclat2, &temp);
+          if (minimize) {
+            fst::Minimize(&temp, &temp2);
+          }
         }
-
+        ConvertLattice(temp2, &lat3);
         compact_lattice_writer.Write(key, lat3);
         ++n_success;
       } else {
