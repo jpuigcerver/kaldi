@@ -37,6 +37,7 @@ void FstExpandWithBreaksRecursive(
     kaldi::VectorHasher<I> >* isym_mapping,
     std::unordered_map<std::vector<O>, typename Arc::Label,
     kaldi::VectorHasher<O> >* osym_mapping,
+    std::unordered_set<typename Arc::StateId>* expanded_from,
     typename Arc::StateId state,
     typename Arc::StateId src_state,
     typename Arc::Weight weight,
@@ -44,6 +45,9 @@ void FstExpandWithBreaksRecursive(
   typedef typename Arc::StateId StateId;
   typedef typename Arc::Label Label;
   typedef typename Arc::Weight Weight;
+  if (isym->empty() && osym->empty())
+    expanded_from->insert(state);
+
   for (fst::ArcIterator<fst::Fst<Arc>> aiter(fst, state); !aiter.Done();
        aiter.Next()) {
     const Arc& arc = aiter.Value();
@@ -61,11 +65,13 @@ void FstExpandWithBreaksRecursive(
         newarc.nextstate = (*state_mapping)[arc.nextstate];
       ofst->AddArc(src_state, newarc);
       ofst->SetFinal(newarc.nextstate, fst.Final(arc.nextstate));
-      if (break_labels.count(arc.olabel) > 0) {
+      if (break_labels.count(arc.olabel) > 0 &&
+          expanded_from->count(arc.nextstate) == 0) {
         std::vector<I> tmp_inp;
         std::vector<O> tmp_out;
         FstExpandWithBreaksRecursive(fst, break_labels, ofst,
                                      state_mapping, isym_mapping, osym_mapping,
+                                     expanded_from,
                                      arc.nextstate, newarc.nextstate,
                                      Weight::One(), &tmp_inp, &tmp_out);
 
@@ -74,6 +80,7 @@ void FstExpandWithBreaksRecursive(
         if (arc.olabel != 0) osym->push_back(arc.olabel);
         FstExpandWithBreaksRecursive(fst, break_labels, ofst,
                                      state_mapping, isym_mapping, osym_mapping,
+                                     expanded_from,
                                      arc.nextstate, newarc.nextstate,
                                      Weight::One(), isym, osym);
         if (arc.ilabel != 0) isym->pop_back();
@@ -84,6 +91,7 @@ void FstExpandWithBreaksRecursive(
       if (arc.olabel != 0) osym->push_back(arc.olabel);
       FstExpandWithBreaksRecursive(fst, break_labels, ofst,
                                    state_mapping, isym_mapping, osym_mapping,
+                                   expanded_from,
                                    arc.nextstate, src_state,
                                    Times(weight, arc.weight), isym, osym);
       if (arc.ilabel != 0) isym->pop_back();
@@ -113,17 +121,19 @@ void FstExpandWithBreaks(
       isym_mapping;
   std::unordered_map<std::vector<O>, Label, kaldi::VectorHasher<O>>
       osym_mapping;
+  std::unordered_set<StateId> expanded_from;
   ofst->SetStart(ofst->AddState());
   state_mapping[fst.Start()] = ofst->Start();
   isym_mapping[std::vector<I>()] = 0;
   osym_mapping[std::vector<O>()] = 0;
+  expanded_from.insert(fst.Start());
 
   std::vector<I> tmp_inp;
   std::vector<O> tmp_out;
   FstExpandWithBreaksRecursive(fst, break_labels, ofst,
                                &state_mapping, &isym_mapping, &osym_mapping,
-                               fst.Start(), ofst->Start(), Weight::One(),
-                               &tmp_inp, &tmp_out);
+                               &expanded_from, fst.Start(), ofst->Start(),
+                               Weight::One(), &tmp_inp, &tmp_out);
 
   if (symbols_inp) {
     symbols_inp->resize(isym_mapping.size());
