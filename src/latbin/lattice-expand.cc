@@ -137,6 +137,14 @@ void FstExpandWithBreaks(
   }
 }
 
+size_t CountNumArcs(const kaldi::CompactLattice& lat) {
+  size_t n = 0;
+  for (fst::StateIterator<kaldi::CompactLattice> s(lat);
+       !s.Done(); s.Next())
+    n += lat.NumArcs(s.Value());
+  return n;
+}
+
 
 int main(int argc, char *argv[]) {
   try {
@@ -218,6 +226,8 @@ int main(int argc, char *argv[]) {
       lattice_reader.FreeCurrent();
       // Scale input lattice
       fst::ScaleLattice(scale, &lat);
+      const size_t original_num_states = lat.NumStates();
+      const size_t original_num_arcs   = CountNumArcs(lat);
       // Prune input lattice, before expansion
       if (KALDI_ISFINITE(beam) && !PruneLattice(beam, &lat)) {
         KALDI_WARN << "Error pruning lattice for utterance " << key;
@@ -228,6 +238,13 @@ int main(int argc, char *argv[]) {
       std::vector< std::vector<fst::StdArc::Label> > isymbols;
       std::vector< std::vector<fst::StdArc::Label> > osymbols;
       FstExpandWithBreaks(lat, break_symbols, &flat, &isymbols, &osymbols);
+      const size_t expanded_num_states = flat.NumStates();
+      const size_t expanded_num_arcs   = CountNumArcs(flat);
+      KALDI_LOG << "Lattice " << key << " expanded from "
+                << original_num_states << " states and "
+                << original_num_arcs << " arcs to "
+                << expanded_num_states << " states and "
+                << expanded_num_arcs << " arcs.";
       // Scale Lattice back to the original scale
       fst::ScaleLattice(inv_scale, &flat);
       // Write CompactLattice
