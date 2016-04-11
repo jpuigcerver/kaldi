@@ -51,8 +51,8 @@ void FstExpandWithBreaksRecursive(
   for (fst::ArcIterator<fst::Fst<Arc>> aiter(fst, state); !aiter.Done();
        aiter.Next()) {
     const Arc& arc = aiter.Value();
-    if (break_labels.count(arc.olabel) > 0 ||
-        fst.Final(arc.nextstate) != Weight::Zero()) {
+    if (break_labels.count(arc.olabel) > 0) {
+      if (expanded_from->count(arc.nextstate) > 0) continue;
       Arc newarc(
           isym_mapping->insert(
               make_pair(*isym, isym_mapping->size())).first->second,
@@ -65,28 +65,29 @@ void FstExpandWithBreaksRecursive(
         newarc.nextstate = (*state_mapping)[arc.nextstate];
       ofst->AddArc(src_state, newarc);
       ofst->SetFinal(newarc.nextstate, fst.Final(arc.nextstate));
-      if (break_labels.count(arc.olabel) > 0 &&
-          expanded_from->count(arc.nextstate) == 0) {
-        std::vector<I> tmp_inp;
-        std::vector<O> tmp_out;
-        FstExpandWithBreaksRecursive(fst, break_labels, ofst,
-                                     state_mapping, isym_mapping, osym_mapping,
-                                     expanded_from,
-                                     arc.nextstate, newarc.nextstate,
-                                     Weight::One(), &tmp_inp, &tmp_out);
-
-      } else {
-        if (arc.ilabel != 0) isym->push_back(arc.ilabel);
-        if (arc.olabel != 0) osym->push_back(arc.olabel);
-        FstExpandWithBreaksRecursive(fst, break_labels, ofst,
-                                     state_mapping, isym_mapping, osym_mapping,
-                                     expanded_from,
-                                     arc.nextstate, newarc.nextstate,
-                                     Weight::One(), isym, osym);
-        if (arc.ilabel != 0) isym->pop_back();
-        if (arc.olabel != 0) osym->pop_back();
-      }
+      std::vector<I> tmp_inp;
+      std::vector<O> tmp_out;
+      FstExpandWithBreaksRecursive(fst, break_labels, ofst,
+                                   state_mapping, isym_mapping, osym_mapping,
+                                   expanded_from,
+                                   arc.nextstate, newarc.nextstate,
+                                   Weight::One(), &tmp_inp, &tmp_out);
     } else {
+      if (fst.Final(arc.nextstate) != Weight::Zero()) {
+        Arc newarc(
+            isym_mapping->insert(
+                make_pair(*isym, isym_mapping->size())).first->second,
+            osym_mapping->insert(
+                make_pair(*osym, osym_mapping->size())).first->second,
+            Times(weight, arc.weight), fst::kNoStateId);
+        if (state_mapping->count(arc.nextstate) == 0)
+          newarc.nextstate = (*state_mapping)[arc.nextstate] = ofst->AddState();
+        else
+          newarc.nextstate = (*state_mapping)[arc.nextstate];
+        ofst->AddArc(src_state, newarc);
+        ofst->SetFinal(newarc.nextstate, fst.Final(arc.nextstate));
+        src_state = newarc.nextstate;
+      }
       if (arc.ilabel != 0) isym->push_back(arc.ilabel);
       if (arc.olabel != 0) osym->push_back(arc.olabel);
       FstExpandWithBreaksRecursive(fst, break_labels, ofst,
@@ -126,7 +127,6 @@ void FstExpandWithBreaks(
   state_mapping[fst.Start()] = ofst->Start();
   isym_mapping[std::vector<I>()] = 0;
   osym_mapping[std::vector<O>()] = 0;
-  expanded_from.insert(fst.Start());
 
   std::vector<I> tmp_inp;
   std::vector<O> tmp_out;
@@ -236,9 +236,9 @@ int main(int argc, char *argv[]) {
       lattice_reader.FreeCurrent();
       // Scale input lattice
       fst::ScaleLattice(scale, &lat);
+      // Prune input lattice, before expansion
       const size_t original_num_states = lat.NumStates();
       const size_t original_num_arcs   = CountNumArcs(lat);
-      // Prune input lattice, before expansion
       if (KALDI_ISFINITE(beam) && !PruneLattice(beam, &lat)) {
         KALDI_WARN << "Error pruning lattice for utterance " << key;
         n_error++;
