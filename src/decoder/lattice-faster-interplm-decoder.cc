@@ -252,7 +252,7 @@ void LatticeFasterInterpLmDecoder::PossiblyResizeHash(size_t num_toks) {
 // (whose head is at active_toks_[frame]).
 inline LatticeFasterInterpLmDecoder::Token*
 LatticeFasterInterpLmDecoder::FindOrAddToken(
-    StateTriplet state, int32 frame_plus_one, BaseFloat aco_cost,
+    StateTriplet state, int32 frame_plus_one, BaseFloat tot_cost,
     BaseFloat hcl_cost, BaseFloat lm1_cost, BaseFloat lm2_cost,
     bool *changed) {
   // Returns the Token pointer.  Sets "changed" (if non-NULL) to true
@@ -265,7 +265,7 @@ LatticeFasterInterpLmDecoder::FindOrAddToken(
     // tokens on the currently final frame have zero extra_cost
     // as any of them could end up
     // on the winning path.
-    Token *new_tok = new Token (aco_cost, hcl_cost, lm1_cost, lm2_cost,
+    Token *new_tok = new Token (tot_cost, hcl_cost, lm1_cost, lm2_cost,
                                 extra_cost, NULL, toks);
     // NULL: no forward links yet
     toks = new_tok;
@@ -275,10 +275,8 @@ LatticeFasterInterpLmDecoder::FindOrAddToken(
     return new_tok;
   } else {
     Token *tok = e_found->val;  // There is an existing Token for this state.
-    const BaseFloat tot_cost =
-        aco_cost + hcl_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost);
-    if (tok->TotalCost() > tot_cost) {  // replace old token
-      tok->aco_cost = aco_cost;
+    if (tok->tot_cost > tot_cost) {  // replace old token
+      tok->tot_cost = tot_cost;
       tok->hcl_cost = hcl_cost;
       tok->lm1_cost = lm1_cost;
       tok->lm2_cost = lm2_cost;
@@ -630,7 +628,7 @@ BaseFloat LatticeFasterInterpLmDecoder::GetCutoff(
   if (config_.max_active == std::numeric_limits<int32>::max() &&
       config_.min_active == 0) {
     for (Elem *e = list_head; e != NULL; e = e->tail, count++) {
-      BaseFloat w = static_cast<BaseFloat>(e->val->TotalCost());
+      BaseFloat w = static_cast<BaseFloat>(e->val->tot_cost);
       if (w < best_weight) {
         best_weight = w;
         if (best_elem) *best_elem = e;
@@ -642,7 +640,7 @@ BaseFloat LatticeFasterInterpLmDecoder::GetCutoff(
   } else {
     tmp_array_.clear();
     for (Elem *e = list_head; e != NULL; e = e->tail, count++) {
-      BaseFloat w = e->val->TotalCost();
+      BaseFloat w = e->val->tot_cost;
       tmp_array_.push_back(w);
       if (w < best_weight) {
         best_weight = w;
@@ -699,17 +697,15 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
                                          // from the decodable object.
   active_toks_.resize(active_toks_.size() + 1);
 
-  Elem *final_toks = toks_.Clear(); // analogous to swapping prev_toks_ / cur_toks_
-                                   // in simple-decoder.h.   Removes the Elems from
-                                   // being indexed in the hash in toks_.
+  Elem *final_toks = toks_.Clear();
   Elem *best_elem = NULL;
   BaseFloat adaptive_beam;
   size_t tok_cnt;
-  BaseFloat cur_cutoff = GetCutoff(final_toks, &tok_cnt, &adaptive_beam, &best_elem);
+  const BaseFloat cur_cutoff = GetCutoff(final_toks, &tok_cnt, &adaptive_beam,
+                                         &best_elem);
   KALDI_VLOG(6) << "Adaptive beam on frame " << NumFramesDecoded() << " is "
                 << adaptive_beam;
-
-  PossiblyResizeHash(tok_cnt);  // This makes sure the hash is always big enough.
+  PossiblyResizeHash(tok_cnt);
 
   BaseFloat next_cutoff = std::numeric_limits<BaseFloat>::infinity();
   // pruning "online" before having seen all tokens
@@ -721,31 +717,66 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
   // reasonably tight bound on the next cutoff.  The only
   // products of the next block are "next_cutoff" and "cost_offset".
   if (best_elem) {
-    StateTriplet state = best_elem->key;
+    const StateTriplet curr_state = best_elem->key;
     Token *tok = best_elem->val;
-    cost_offset = - tok->TotalCost();
-    for (fst::ArcIterator<fst::Fst<Arc> > aiter(hcl_, state[0]);
+    cost_offset = -tok->tot_cost;
+    for (fst::ArcIterator<fst::Fst<Arc> > aiter(hcl_, curr_state[0]);
          !aiter.Done(); aiter.Next()) {
-      Arc arc_hcl = aiter.Value();
-      if (arc_hcl.ilabel == 0) continue;
+      const Arc& hcl_arc = aiter.Value();
+      if (hcl_arc.ilabel == 0) continue;
+      const BaseFloat acoustic_cost =
+          -decodable->LogLikelihood(frame, hcl_arc.ilabel);
 
-      tok->aco_cost - decodable->LogLikelihood(frame, arc_hcl.ilabel);
-      tok->hcl_cost + arc_hcl.weight.Value();
-      if (arc_hcl.olabel != 0) {
-        fst::SortedMatcher<fst::Fst<Arc>> sm1(lm1_, MATCH_INPUT, 1);
-        fst::SortedMatcher<fst::Fst<Arc>> sm2(lm2_, MATCH_INPUT, 1);
-        sm1.SetState(state[1]);
-        sm2.SetState(state[2]);
-
+      if (hcl_arc.olabel == 0) {    // HCL arc has an epsilon output label
+        const BaseFloat new_weight =
+            acoustic_cost + hcl_arc.weight.Value();
+        if (tot_cost + adaptive_beam < next_cutoff)
+          next_cutoff = tot_cost + adaptive_beam;
+      } else {
+        // Use the arc matchers of each LM fst to find all pairs of arcs
+        // from the current states with the appropiate input label.
+        matcher1_.SetState(curr_state[1]);
+        matcher2_.SetState(curr_state[2]);
+        std::vector<Arc> lm1_arcs, lm2_arcs;
+        for (matcher1_.Find(hcl_arc.olabel); !matcher1_.Done();
+             matcher1_.Next()) {
+          lm1_arcs.push_back(matcher1_.Value());
+        }
+        for (matcher2_.Find(hcl_arc.olabel); !matcher2_.Done();
+             matcher2_.Next()) {
+          lm2_arcs.push_back(matcher2_.Value());
+        }
+        if (!lm1_arcs.empty() && !lm2_arcs.empty()) {
+          // Both LM have arcs with hcl_arc.olabel input label
+          for (const Arc& lm1_arc : lm1_arcs) {
+            const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+            for (const Arc& lm2_arc : lm2_arcs) {
+              const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+              const BaseFloat tot_cost =
+                  tmp_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost);
+              if (tot_cost + adaptive_beam < next_cutoff)
+                next_cutoff = tot_cost + adaptive_beam;
+            }
+          }
+        } else if (!lm1_arcs.empty()) {
+          // Only LM1 has arcs with hcl_arc.olabel input label
+          for (const Arc& lm1_arc : lm1_arcs) {
+            const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+            const BaseFloat tot_cost = tmp_cost + lm1_cost;
+            if (tot_cost + adaptive_beam < next_cutoff)
+              next_cutoff = tot_cost + adaptive_beam;
+          }
+        } else if (!lm2_arcs.empty()) {
+          // Only LM2 has arcs with hcl_arc.olabel input label
+          for (const Arc& lm2_arc : lm2_arcs) {
+            const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+            const BaseFloat tot_cost = tmp_cost + lm2_cost;
+            if (tot_cost > cutoff) continue;
+            if (tot_cost + adaptive_beam < next_cutoff)
+              next_cutoff = tot_cost + adaptive_beam;
+          }
+        }
       }
-
-
-      arc.weight = Times(arc.weight,
-                         Weight(cost_offset -
-                                decodable->LogLikelihood(frame, arc.ilabel)));
-      BaseFloat new_weight = arc.weight.Value() + tok->tot_cost;
-      if (new_weight + adaptive_beam < next_cutoff)
-        next_cutoff = new_weight + adaptive_beam;
     }
   }
 
@@ -762,15 +793,21 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
     // loop this way because we delete "e" as we go.
     StateId state = e->key;
     Token *tok = e->val;
-    if (tok->tot_cost <= cur_cutoff) {
-      for (fst::ArcIterator<fst::Fst<Arc> > aiter(fst_, state);
-           !aiter.Done();
-           aiter.Next()) {
-        const Arc &arc = aiter.Value();
-        if (arc.ilabel != 0) {  // propagate..
-          BaseFloat ac_cost = cost_offset -
-              decodable->LogLikelihood(frame, arc.ilabel),
-              graph_cost = arc.weight.Value(),
+    if (tok->tot_cost > cur_cutoff) continue;
+
+    for (fst::ArcIterator<fst::Fst<Arc> > aiter(hcl_, state); !aiter.Done();
+         aiter.Next()) {
+      const Arc &hcl_arc = aiter.Value();
+      if (hcl_arc.ilabel == 0) continue;
+
+      const BaseFloat lkh = decodable->LogLikelihood(frame, hcl_arc.ilabel);
+      const BaseFloat hcl_cost = tok->hcl_cost + hcl_arc.weight.Value();
+      const BaseFloat tmp_cost =
+          tok->tot_cost - tok->LMCost() - lkh + hcl_arc.weight.Value();
+      if (tmp_cost > next_cutoff) continue;
+
+
+      graph_cost = arc.weight.Value(),
               cur_cost = tok->tot_cost,
               tot_cost = cur_cost + ac_cost + graph_cost;
           if (tot_cost > next_cutoff) continue;
@@ -810,6 +847,7 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
   KALDI_ASSERT(queue_.empty());
   for (const Elem *e = toks_.GetList(); e != NULL;  e = e->tail)
     queue_.push_back(e->key);
+
   if (queue_.empty()) {
     if (!warned_) {
       KALDI_WARN << "Error, no surviving tokens: frame is " << frame;
@@ -818,13 +856,12 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
   }
 
   while (!queue_.empty()) {
-    StateTriplet state = queue_.back();
+    StateTriplet curr_state = queue_.back();
     queue_.pop_back();
 
-    Token *tok = toks_.Find(state)->val;  // would segfault if state not in toks_ but this can't happen.
-    BaseFloat cur_cost = tok->TotalCost();
-    if (cur_cost > cutoff) // Don't bother processing successors.
-      continue;
+    Token *tok = toks_.Find(state)->val;
+    if (tok->tot_cost > cutoff) continue;
+
     // If "tok" has any existing forward links, delete them,
     // because we're about to regenerate them.  This is a kind
     // of non-optimality (remember, this is the simple decoder),
@@ -833,66 +870,144 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
     tok->links = NULL;
 
     // Process all arcs with input epsilon in HCL
-    for (fst::ArcIterator<Fst> aiter(hcl_, state[0]); !aiter.Done(); aiter.Next()) {
+    for (fst::ArcIterator<Fst> aiter(hcl_, curr_state[0]); !aiter.Done();
+         aiter.Next()) {
       const Arc &hcl_arc = aiter.Value();
-      if (hcl_arc.ilabel != 0) continue;
-      if (hcl_arc.olabel == 0) {
-        const BaseFloat tot_cost  = tok->TotalCost() + hcl_arc.weight.Value();
-        if (tot_cost < cutoff) {
-          const StateTriplet ns(hcl_arc.nextstate, state[1], state[2]);
-          bool changed;
-          Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
-          tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(), 0.0, 0.0, tok->links);
-          if (changed) queue_.push_back(ns);
+      if (hcl_arc.ilabel != 0) continue;  // Skip arcs with non-epsilon input
+      const BaseFloat hcl_cost = tok->hcl_cost + hcl_arc.weight.Value();
+      if (hcl_arc.olabel == 0) {    // HCL arc has an epsilon output label
+        const BaseFloat tot_cost = tok->tot_cost + hcl_arc.weight.Value();
+        if (tot_cost > cutoff) continue;
+        const StateTriplet ns(hcl_arc.nextstate, curr_state[1], curr_state[2]);
+        bool changed;
+        Token *new_tok = FindOrAddToken(
+            ns, frame + 1, tot_cost, hcl_cost, tok->lm1_cost, tok->lm2_cost,
+            &changed);
+        tok->links = new ForwardLink(
+            new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(),
+            0.0, 0.0, tok->links);
+        if (changed) queue_.push_back(ns);
+      } else {                      // HCL arc has a non-epsilon output label
+        // Total cost of the token, minus interpolated LM cost
+        const BaseFloat tmp_cost = tok->tot_cost + hcl_arc.weight.Value()
+            - tok->LMCost();
+        // Use the arc matchers of each LM fst to find all pairs of arcs
+        // from the current states with the appropiate input label.
+        matcher1_.SetState(curr_state[1]);
+        matcher2_.SetState(curr_state[2]);
+        std::vector<Arc> lm1_arcs, lm2_arcs;
+        for (matcher1_.Find(hcl_arc.olabel); !matcher1_.Done();
+             matcher1_.Next()) {
+          lm1_arcs.push_back(matcher1_.Value());
         }
-      } else {
-        matcher1_.SetState(state[1]);
-        matcher2_.SetState(state[2]);
-        for (matcher1_.Find(hcl_arc.olabel); !matcher1_.Done(); matcher1_.Next()) {
-          const Arc& lm1_arc = matcher1_.Value();
-          const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
-          for (matcher2_.Find(hcl_arc.olabel); !matcher2_.Done(); matcher2_.Next()) {
-            const Arc& lm2_arc = matcher2_.Value();
-            const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
-            const BaseFloat tot_cost = Token::TotalCost(tok->aco_cost, hcl_cost, lm1_cost, lm2_cost);
-            if (tot_cost < cutoff) {
-              const StateTriplet ns(hcl_arc.nextstate, lm1_arc.nextstate, lm2_arc.nextstate);
+        for (matcher2_.Find(hcl_arc.olabel); !matcher2_.Done();
+             matcher2_.Next()) {
+          lm2_arcs.push_back(matcher2_.Value());
+        }
+
+        if (!lm1_arcs.empty() && !lm2_arcs.empty()) {
+          // Both LM have arcs with hcl_arc.olabel input label
+          for (const Arc& lm1_arc : lm1_arcs) {
+            const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+            for (const Arc& lm2_arc : lm2_arcs) {
+              const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+              const BaseFloat tot_cost =
+                  tmp_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost);
+              if (tot_cost > cutoff) continue;
+              const StateTriplet new_state(
+                  hcl_arc.nextstate, lm1_arc.nextstate, lm2_arc.nextstate);
               bool changed;
-              Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
-              tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(), lm1_arc.weight.Value(), lm2_arc.weight.Value(), tok->links);
-              if (changed) queue_.push_back(ns);
+              Token *new_tok = FindOrAddToken(
+                  new_state, frame + 1, tot_cost, hcl_cost, lm1_cost, lm2_cost,
+                  &changed);
+              tok->links = new ForwardLink(
+                  new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(),
+                  lm1_arc.weight.Value(), lm2_arc.weight.Value(), tok->links);
+              if (changed) queue_.push_back(new_state);
             }
+          }
+        } else if (!lm1_arcs.empty()) {
+          // Only LM1 has arcs with hcl_arc.olabel input label
+          for (const Arc& lm1_arc : lm1_arcs) {
+            const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+            const BaseFloat lm2_cost = Weight::Zero().Value();
+            const BaseFloat tot_cost = tmp_cost + lm1_cost;
+            if (tot_cost > cutoff) continue;
+            const StateTriplet new_state(
+                hcl_arc.nextstate, lm1_arc.nextstate, fst::kNoStateId);
+            bool changed;
+            Token *new_tok = FindOrAddToken(
+                new_state, frame + 1, tot_cost, hcl_cost, lm1_cost, lm2_cost,
+                &changed);
+            tok->links = new ForwardLink(
+                new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(),
+                lm1_arc.weight.Value(), Weight::Zero().Value(), tok->links);
+            if (changed) queue_.push_back(new_state);
+          }
+        } else if (!lm2_arcs.empty()) {
+          // Only LM2 has arcs with hcl_arc.olabel input label
+          for (const Arc& lm2_arc : lm2_arcs) {
+            const BaseFloat lm1_cost = Weight::Zero().Value();
+            const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+            const BaseFloat tot_cost = tmp_cost + lm2_cost;
+            if (tot_cost > cutoff) continue;
+            const StateTriplet new_state(
+                hcl_arc.nextstate, fst::kNoStateId, lm2_arc.nextstate);
+            bool changed;
+            Token *new_tok = FindOrAddToken(
+                new_state, frame + 1, tot_cost, hcl_cost, lm1_cost, lm2_cost,
+                &changed);
+            tok->links = new ForwardLink(
+                new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(),
+                Weight::Zero().Value(), lm2_arc.weight.Value(), tok->links);
+            if (changed) queue_.push_back(new_state);
           }
         }
       }
     } // for all arcs with input epsilon in HCL
 
-    // process all arcs with input epsilon in LM1
-    for (fst::ArcIterator<Fst> aiter(lm1_, state[1]); !aiter.Done(); aiter.Next()) {
+    // Process all arcs with input epsilon in LM1
+    for (fst::ArcIterator<Fst> aiter(lm1_, curr_state[1]); !aiter.Done();
+         aiter.Next()) {
       const Arc& lm1_arc = aiter.Value();
       if (lm1_arc.ilabel != 0) continue;
-      const BaseFloat tot_cost = Token::TotalCost(tok->aco_cost, tok->hcl_cost, tok->lm1_cost + lm1_arc.weight.Value(), tok->lm2_cost);
-      if (tot_cost < cutoff) {
-        const StateTriplet ns(state[0], lm1_arc.nextstate, state[2]);
-        bool changed;
-        Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
-        tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, 0.0, lm1_arc.weight.Value(), 0.0, tok->links);
-        if (changed) queue_.push_back(ns);
-      }
+      const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+      const BaseFloat lm2_cost = tok->lm2_cost;
+      const BaseFloat tot_cost =
+          tok->tot_cost - tok->LMCost() - kaldi::LogAdd(-lm1_cost, -lm2_cost);
+      if (tot_cost > cutoff) continue;
+      const StateTriplet new_state(
+          hcl_arc.nextstate, lm1_arc.nextstate, curr_state[2]);
+      bool changed;
+      Token *new_tok = FindOrAddToken(
+          new_state, frame + 1, tot_cost, hcl_cost, lm1_cost, lm2_cost,
+          &changed);
+      tok->links = new ForwardLink(
+          new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(),
+          lm1_arc.weight.Value(), 0.0, tok->links);
+      if (changed) queue_.push_back(new_state);
     }
 
     // process all arcs with input epsilon in LM2
-    for (fst::ArcIterator<Fst> aiter(lm2_, state[2]); !aiter.Done(); aiter.Next()) {
+    for (fst::ArcIterator<Fst> aiter(lm2_, curr_state[2]); !aiter.Done();
+         aiter.Next()) {
       const Arc& lm2_arc = aiter.Value();
       if (lm2_arc.ilabel != 0) continue;
-      const BaseFloat tot_cost = Token::TotalCost(tok->aco_cost, tok->hcl_cost, tok->lm1_cost, tok->lm2_cost + lm2_arc.weight.Value());
-      if (tot_cost < cutoff) {
-        const StateTriplet ns(state[0], state[1], lm2_arc.nextstate);
-        bool changed;
-        Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
-        tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, 0.0, 0.0, lm2_arc.weight.Value(), tok->links);
-        if (changed) queue_.push_back(ns);
-      }
+      const BaseFloat lm1_cost = tok->lm1_cost;
+      const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+      const BaseFloat tot_cost =
+          tok->tot_cost - tok->LMCost() - kaldi::LogAdd(-lm1_cost, -lm2_cost);
+      if (tot_cost > cutoff) continue;
+      const StateTriplet new_state(
+          hcl_arc.nextstate, curr_state[1], lm2_arc.nextstate);
+      bool changed;
+      Token *new_tok = FindOrAddToken(
+          new_state, frame + 1, tot_cost, hcl_cost, lm1_cost, lm2_cost,
+          &changed);
+      tok->links = new ForwardLink(
+          new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(),
+          0.0, lm2_arc.weight.Value(), tok->links);
+      if (changed) queue_.push_back(new_state);
     }
   } // while queue not empty
 }
@@ -922,8 +1037,8 @@ void LatticeFasterInterpLmDecoder::ClearActiveTokens() { // a cleanup routine, a
 }
 
 // static
-void LatticeFasterInterpLmDecoder::TopSortTokens(Token *tok_list,
-                                         std::vector<Token*> *topsorted_list) {
+void LatticeFasterInterpLmDecoder::TopSortTokens(
+    Token *tok_list, std::vector<Token*> *topsorted_list) {
   unordered_map<Token*, int32> token2pos;
   typedef unordered_map<Token*, int32>::iterator IterType;
   int32 num_toks = 0;
@@ -963,7 +1078,8 @@ void LatticeFasterInterpLmDecoder::TopSortTokens(Token *tok_list,
     reprocess.erase(tok);
   }
 
-  size_t max_loop = 1000000, loop_count; // max_loop is to detect epsilon cycles.
+  // max_loop is to detect epsilon cycles.
+  size_t max_loop = 1000000, loop_count;
   for (loop_count = 0;
        !reprocess.empty() && loop_count < max_loop; ++loop_count) {
     std::vector<Token*> reprocess_vec;

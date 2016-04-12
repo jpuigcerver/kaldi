@@ -297,6 +297,10 @@ class LatticeFasterInterpLmDecoder {
 
     inline BaseFloat TotalCost() const { return tot_cost; }
 
+    inline BaseFloat LMCost() const {
+      return -kaldi::LogAdd(-lm1_cost, -lm2_cost);
+    }
+
     inline BaseFloat AcousticCost() const {
       return tot_cost - (hcl_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost));
     }
