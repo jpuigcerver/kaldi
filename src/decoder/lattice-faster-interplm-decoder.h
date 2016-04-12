@@ -102,20 +102,15 @@ class LatticeFasterInterpLmDecoder {
   typedef Arc::Label Label;
   typedef Arc::StateId StateId;
   typedef Arc::Weight Weight;
-
+  typedef fst::Fst<Arc> Fst;
   // instantiate this class once for each thing you have to decode.
-  LatticeFasterInterpLmDecoder(
-      const fst::Fst<fst::StdArc> &hcl,
-      const fst::Fst<fst::StdArc> &lm1,
-      const fst::Fst<fst::StdArc> &lm2,
-      const LatticeFasterInterpLmDecoderConfig &config);
+  LatticeFasterInterpLmDecoder(const Fst &hcl, const Fst &lm1, const Fst &lm2,
+                               const LatticeFasterInterpLmDecoderConfig &config);
 
   // This version of the initializer "takes ownership" of the fst,
   // and will delete it when this object is destroyed.
-  LatticeFasterInterpLmDecoder(const LatticeFasterDecoderConfig &config,
-                               fst::Fst<fst::StdArc> *hcl,
-                               fst::Fst<fst::StdArc> *lm1,
-                               const fst::Fst<fst::StdArc> *lm2);
+  LatticeFasterInterpLmDecoder(const LatticeFasterInterpLmDecoderConfig &config,
+                               const Fst *hcl, const Fst *lm1, const Fst *lm2);
 
 
   void SetOptions(const LatticeFasterDecoderConfig &config) {
@@ -270,10 +265,10 @@ class LatticeFasterInterpLmDecoder {
   // When first created, a Token just has the (total) cost.    We add forward
   // links from it when we process the next frame.
   struct Token {
-    BaseFloat aco_cost;  // Accumulated acoustic cost
-    BaseFloat hcl_cost;       // Accumulated cost through HCL
-    BaseFloat lm1_cost;       // Accumulated cost through LM1
-    BaseFloat lm2_cost;       // Accumulated cost through LM2
+    BaseFloat tot_cost;   // Accumulated total cost
+    BaseFloat hcl_cost;   // Accumulated cost through HCL
+    BaseFloat lm1_cost;   // Accumulated cost through LM1
+    BaseFloat lm2_cost;   // Accumulated cost through LM2
     BaseFloat extra_cost; // >= 0.  After calling PruneForwardLinks, this equals
     // the minimum difference between the cost of the best path, and the cost of
     // this is on, and the cost of the absolute best path, under the assumption
@@ -285,10 +280,10 @@ class LatticeFasterInterpLmDecoder {
 
     Token *next; // Next in list of tokens for this frame.
 
-    inline Token(BaseFloat aco_cost, BaseFloat hcl_cost, BaseFloat lm1_cost,
+    inline Token(BaseFloat tot_cost, BaseFloat hcl_cost, BaseFloat lm1_cost,
                  BaseFloat lm2_cost, BaseFloat extra_cost, ForwardLink *links,
                  Token *next):
-        aco_cost(aco_cost), hcl_cost(hcl_cost), lm1_cost(lm1_cost),
+        tot_cost(tot_cost), hcl_cost(hcl_cost), lm1_cost(lm1_cost),
         lm2_cost(lm2_cost), extra_cost(extra_cost), links(links), next(next) { }
     inline void DeleteForwardLinks() {
       ForwardLink *l = links, *m;
@@ -300,7 +295,20 @@ class LatticeFasterInterpLmDecoder {
       links = NULL;
     }
 
-    inline BaseFloat TotalCost() const {
+    inline BaseFloat TotalCost() const { return tot_cost; }
+
+    inline BaseFloat AcousticCost() const {
+      return tot_cost - (hcl_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost));
+    }
+
+    inline BaseFloat HCLCost() const { return hcl_cost; }
+
+    inline BaseFloat LM1Cost() const { return lm1_cost; }
+
+    inline BaseFloat LM2Cost() const { return lm2_cost; }
+
+    inline static BaseFloat TotalCost(BaseFloat aco_cost, BaseFloat hcl_cost,
+                                      BaseFloat lm1_cost, BaseFloat lm2_cost) {
       return aco_cost + hcl_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost);
     }
   };
@@ -421,9 +429,11 @@ class LatticeFasterInterpLmDecoder {
   std::vector<StateTriplet> queue_;  // temp variable used in ProcessNonemitting,
   std::vector<BaseFloat> tmp_array_;  // used in GetCutoff.
   // make it class member to avoid internal new/delete.
-  const fst::Fst<fst::StdArc> &hcl_;
-  const fst::Fst<fst::StdArc> &lm1_;
-  const fst::Fst<fst::StdArc> &lm2_;
+  const Fst &hcl_;
+  const Fst &lm1_;
+  const Fst &lm2_;
+  fst::SortedMatcher<Fst> matcher1_;
+  fst::SortedMatcher<Fst> matcher2_;
   bool delete_fst_;
   std::vector<BaseFloat> cost_offsets_; // This contains, for each
   // frame, an offset that was added to the acoustic log-likelihoods on that

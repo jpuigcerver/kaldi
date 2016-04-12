@@ -35,8 +35,9 @@ LatticeFasterInterpLmDecoder::LatticeFasterInterpLmDecoder(
     const fst::Fst<fst::StdArc> &lm1,
     const fst::Fst<fst::StdArc> &lm2,
     const LatticeFasterInterpLmDecoderConfig &config):
-    hcl_(hcl), lm1_(lm1), lm2_(lm2) delete_fst_(false), config_(config),
-    num_toks_(0) {
+    hcl_(hcl), lm1_(lm1), lm2_(lm2),
+    matcher1_(lm1_, MATCH_INPUT, 1), matcher2_(lm2_, MATCH_INPUT, 1),
+    delete_fst_(false), config_(config), num_toks_(0) {
   config.Check();
   toks_.SetSize(1000);  // just so on the first frame we do something reasonable.
   KALDI_ASSERT(lm1_.Properties(kILabelSorted, true));
@@ -49,8 +50,9 @@ LatticeFasterInterpLmDecoder::LatticeFasterInterpLmDecoder(
     fst::Fst<fst::StdArc> *hcl,
     fst::Fst<fst::StdArc> *lm1,
     fst::Fst<fst::StdArc> *lm2) :
-    hcl_(*hcl), lm1_(*lm1), lm2_(*lm2), delete_fst_(true), config_(config),
-    num_toks_(0) {
+    hcl_(*hcl), lm1_(*lm1), lm2_(*lm2),
+    matcher1_(lm1_, MATCH_INPUT, 1), matcher2_(lm2_, MATCH_INPUT, 1),
+    delete_fst_(true), config_(config), num_toks_(0) {
   config.Check();
   toks_.SetSize(1000);  // just so on the first frame we do something reasonable.
   KALDI_ASSERT(lm1_.Properties(kILabelSorted, true));
@@ -734,12 +736,7 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
         fst::SortedMatcher<fst::Fst<Arc>> sm2(lm2_, MATCH_INPUT, 1);
         sm1.SetState(state[1]);
         sm2.SetState(state[2]);
-        sm1.Find(arc_hcl.olabel);
-        sm2.Find(arc_hcl.olabel);
-        for (;!sm1.Done(); sm1.Next()) {
-          for (;!sm2.Done(); sm2.Next()) {
-          }
-        }
+
       }
 
 
@@ -821,11 +818,11 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
   }
 
   while (!queue_.empty()) {
-    StateId state = queue_.back();
+    StateTriplet state = queue_.back();
     queue_.pop_back();
 
     Token *tok = toks_.Find(state)->val;  // would segfault if state not in toks_ but this can't happen.
-    BaseFloat cur_cost = tok->tot_cost;
+    BaseFloat cur_cost = tok->TotalCost();
     if (cur_cost > cutoff) // Don't bother processing successors.
       continue;
     // If "tok" has any existing forward links, delete them,
@@ -834,28 +831,69 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
     // but since most states are emitting it's not a huge issue.
     tok->DeleteForwardLinks(); // necessary when re-visiting
     tok->links = NULL;
-    for (fst::ArcIterator<fst::Fst<Arc> > aiter(fst_, state);
-         !aiter.Done();
-         aiter.Next()) {
-      const Arc &arc = aiter.Value();
-      if (arc.ilabel == 0) {  // propagate nonemitting only...
-        BaseFloat graph_cost = arc.weight.Value(),
-            tot_cost = cur_cost + graph_cost;
+
+    // Process all arcs with input epsilon in HCL
+    for (fst::ArcIterator<Fst> aiter(hcl_, state[0]); !aiter.Done(); aiter.Next()) {
+      const Arc &hcl_arc = aiter.Value();
+      if (hcl_arc.ilabel != 0) continue;
+      if (hcl_arc.olabel == 0) {
+        const BaseFloat tot_cost  = tok->TotalCost() + hcl_arc.weight.Value();
         if (tot_cost < cutoff) {
+          const StateTriplet ns(hcl_arc.nextstate, state[1], state[2]);
           bool changed;
-
-          Token *new_tok = FindOrAddToken(arc.nextstate, frame + 1, tot_cost,
-                                          &changed);
-
-          tok->links = new ForwardLink(new_tok, 0, arc.olabel,
-                                       graph_cost, 0, tok->links);
-
-          // "changed" tells us whether the new token has a different
-          // cost from before, or is new [if so, add into queue].
-          if (changed) queue_.push_back(arc.nextstate);
+          Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
+          tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(), 0.0, 0.0, tok->links);
+          if (changed) queue_.push_back(ns);
+        }
+      } else {
+        matcher1_.SetState(state[1]);
+        matcher2_.SetState(state[2]);
+        for (matcher1_.Find(hcl_arc.olabel); !matcher1_.Done(); matcher1_.Next()) {
+          const Arc& lm1_arc = matcher1_.Value();
+          const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+          for (matcher2_.Find(hcl_arc.olabel); !matcher2_.Done(); matcher2_.Next()) {
+            const Arc& lm2_arc = matcher2_.Value();
+            const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+            const BaseFloat tot_cost = Token::TotalCost(tok->aco_cost, hcl_cost, lm1_cost, lm2_cost);
+            if (tot_cost < cutoff) {
+              const StateTriplet ns(hcl_arc.nextstate, lm1_arc.nextstate, lm2_arc.nextstate);
+              bool changed;
+              Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
+              tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, hcl_arc.weight.Value(), lm1_arc.weight.Value(), lm2_arc.weight.Value(), tok->links);
+              if (changed) queue_.push_back(ns);
+            }
+          }
         }
       }
-    } // for all arcs
+    } // for all arcs with input epsilon in HCL
+
+    // process all arcs with input epsilon in LM1
+    for (fst::ArcIterator<Fst> aiter(lm1_, state[1]); !aiter.Done(); aiter.Next()) {
+      const Arc& lm1_arc = aiter.Value();
+      if (lm1_arc.ilabel != 0) continue;
+      const BaseFloat tot_cost = Token::TotalCost(tok->aco_cost, tok->hcl_cost, tok->lm1_cost + lm1_arc.weight.Value(), tok->lm2_cost);
+      if (tot_cost < cutoff) {
+        const StateTriplet ns(state[0], lm1_arc.nextstate, state[2]);
+        bool changed;
+        Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
+        tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, 0.0, lm1_arc.weight.Value(), 0.0, tok->links);
+        if (changed) queue_.push_back(ns);
+      }
+    }
+
+    // process all arcs with input epsilon in LM2
+    for (fst::ArcIterator<Fst> aiter(lm2_, state[2]); !aiter.Done(); aiter.Next()) {
+      const Arc& lm2_arc = aiter.Value();
+      if (lm2_arc.ilabel != 0) continue;
+      const BaseFloat tot_cost = Token::TotalCost(tok->aco_cost, tok->hcl_cost, tok->lm1_cost, tok->lm2_cost + lm2_arc.weight.Value());
+      if (tot_cost < cutoff) {
+        const StateTriplet ns(state[0], state[1], lm2_arc.nextstate);
+        bool changed;
+        Token *new_tok = FindOrAddToken(ns, frame + 1, tot_cost, &changed);
+        tok->links = new ForwardLink(new_tok, 0, hcl_arc.olabel, 0.0, 0.0, 0.0, lm2_arc.weight.Value(), tok->links);
+        if (changed) queue_.push_back(ns);
+      }
+    }
   } // while queue not empty
 }
 
