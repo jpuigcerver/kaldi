@@ -1,7 +1,6 @@
-// latbin/lattice-determinize.cc
+// latbin/lattice-expand.cc
 
-// Copyright 2009-2012  Microsoft Corporation
-//           2012-2013  Johns Hopkins University (Author: Daniel Povey)
+// Copyright 2016       Joan Puigcerver
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -24,7 +23,6 @@
 #include "fstext/fstext-lib.h"
 #include "lat/kaldi-lattice.h"
 #include "lat/lattice-functions.h"
-#include "lat/minimize-lattice.h"
 
 template<class Arc, class I, class O>
 void FstExpandWithBreaksRecursive(
@@ -52,7 +50,6 @@ void FstExpandWithBreaksRecursive(
        aiter.Next()) {
     const Arc& arc = aiter.Value();
     if (break_labels.count(arc.olabel) > 0) {
-      if (expanded_from->count(arc.nextstate) > 0) continue;
       Arc newarc(
           isym_mapping->insert(
               make_pair(*isym, isym_mapping->size())).first->second,
@@ -65,13 +62,15 @@ void FstExpandWithBreaksRecursive(
         newarc.nextstate = (*state_mapping)[arc.nextstate];
       ofst->AddArc(src_state, newarc);
       ofst->SetFinal(newarc.nextstate, fst.Final(arc.nextstate));
-      std::vector<I> tmp_inp;
-      std::vector<O> tmp_out;
-      FstExpandWithBreaksRecursive(fst, break_labels, ofst,
-                                   state_mapping, isym_mapping, osym_mapping,
-                                   expanded_from,
-                                   arc.nextstate, newarc.nextstate,
-                                   Weight::One(), &tmp_inp, &tmp_out);
+      if (expanded_from->count(arc.nextstate) == 0) {
+        std::vector<I> tmp_inp;
+        std::vector<O> tmp_out;
+        FstExpandWithBreaksRecursive(fst, break_labels, ofst,
+                                     state_mapping, isym_mapping, osym_mapping,
+                                     expanded_from,
+                                     arc.nextstate, newarc.nextstate,
+                                     arc.weight, &tmp_inp, &tmp_out);
+      }
     } else {
       if (fst.Final(arc.nextstate) != Weight::Zero()) {
         Arc newarc(
