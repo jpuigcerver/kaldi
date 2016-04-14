@@ -295,25 +295,8 @@ class LatticeFasterInterpLmDecoder {
       links = NULL;
     }
 
-    inline BaseFloat TotalCost() const { return tot_cost; }
-
     inline BaseFloat LMCost() const {
       return -kaldi::LogAdd(-lm1_cost, -lm2_cost);
-    }
-
-    inline BaseFloat AcousticCost() const {
-      return tot_cost - (hcl_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost));
-    }
-
-    inline BaseFloat HCLCost() const { return hcl_cost; }
-
-    inline BaseFloat LM1Cost() const { return lm1_cost; }
-
-    inline BaseFloat LM2Cost() const { return lm2_cost; }
-
-    inline static BaseFloat TotalCost(BaseFloat aco_cost, BaseFloat hcl_cost,
-                                      BaseFloat lm1_cost, BaseFloat lm2_cost) {
-      return aco_cost + hcl_cost - kaldi::LogAdd(-lm1_cost, -lm2_cost);
     }
   };
 
@@ -438,6 +421,10 @@ class LatticeFasterInterpLmDecoder {
   const Fst &lm2_;
   fst::SortedMatcher<Fst> matcher1_;
   fst::SortedMatcher<Fst> matcher2_;
+  std::vector<Arc> lm1_arcs_;  // Avoid re-allocating memory
+  std::vector<Arc> lm2_arcs_;  // Avoid re-allocating memory
+  std::unordered_set<Arc> lm1_unmatched_arcs_;
+  std::unordered_set<Arc> lm2_unmatched_arcs_;
   bool delete_fst_;
   std::vector<BaseFloat> cost_offsets_; // This contains, for each
   // frame, an offset that was added to the acoustic log-likelihoods on that
@@ -484,6 +471,44 @@ class LatticeFasterInterpLmDecoder {
                             std::vector<Token*> *topsorted_list);
 
   void ClearActiveTokens();
+
+  // Find all output arcs from state s with input label l, using the sorted
+  // matcher m.
+  static void FindILabelArcs(StateId s, Label l, fst::SortedMatcher<Fst>* m,
+                             std::vector<Arc>* arcs);
+
+  void AddEmittingToken(
+      Token* tok, StateId next_hcl, StateId next_lm1, StateId next_lm2,
+      int32 frame, Label ilabel, Label olabel,
+      BaseFloat tot_cost, BaseFloat hcl_cost, BaseFloat lm1_cost,
+      BaseFloat lm2_cost, BaseFloat nlkh, BaseFloat hcl_arc_w,
+      BaseFloat lm1_arc_w, BaseFloat lm2_arc_w, BaseFloat adaptive_beam,
+      BaseFloat* next_cutoff) {
+    KALDI_ASSERT(next_cutoff != NULL);
+    if (tot_cost >= *next_cutoff) return;
+    if (tot_cost + adaptive_beam < *next_cutoff)
+      *next_cutoff = tot_cost + adaptive_beam;
+    Token *new_tok = FindOrAddToken(StateTriplet(next_hcl, next_lm1, next_lm2),
+                                    frame + 1, tot_cost, hcl_cost, lm1_cost,
+                                    lm2_cost, NULL);
+    tok->links = new ForwardLink(new_tok, ilabel, olabel, nlkh, hcl_arc_w,
+                                 lm1_arc_w, lm2_arc_w, tok->links);
+  }
+
+  void AddNonemittingToken(
+      Token* tok, StateId next_hcl, StateId next_lm1, StateId next_lm2,
+      int32 frame, Label olabel, BaseFloat tot_cost, BaseFloat hcl_cost,
+      BaseFloat lm1_cost, BaseFloat lm2_cost, BaseFloat hcl_arc_w,
+      BaseFloat lm1_arc_w, BaseFloat lm2_arc_w, BaseFloat cutoff) {
+    if (tot_cost >= cutoff) continue;
+    const StateTriplet new_state(next_hcl, next_lm1, next_lm2);
+    bool changed;
+    Token *new_tok = FindOrAddToken(
+        new_state, frame + 1, tot_cost, hcl_cost, lm1_cost, lm2_cost, &changed);
+    tok->links = new ForwardLink(new_tok, 0, olabel, 0.0, hcl_arc_w,
+                                 lm1_arc_w, lm2_arc_w, tok->links);
+    if (changed) queue_.push_back(new_state);
+  }
 
   KALDI_DISALLOW_COPY_AND_ASSIGN(LatticeFasterInterpLmDecoder);
 };
