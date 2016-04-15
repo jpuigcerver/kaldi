@@ -35,6 +35,30 @@
 #include "lat/determinize-lattice-pruned.h"
 #include "lat/kaldi-lattice.h"
 
+namespace std {
+
+template <>
+struct hash<fst::StdArc> {
+  size_t operator()(const fst::StdArc& arc) const {
+    std::hash<fst::StdArc::Label> label_hasher;
+    std::hash<fst::StdArc::StateId> state_hasher;
+    const size_t hash_ilabel = label_hasher(arc.ilabel);
+    const size_t hash_olabel = label_hasher(arc.olabel);
+    const size_t hash_weight = arc.weight.Hash();
+    const size_t hash_nextstate = state_hasher(arc.nextstate);
+    return hash_ilabel ^ hash_olabel ^ hash_weight ^ hash_nextstate;
+  }
+};
+
+template <>
+struct equal_to<fst::StdArc> {
+  bool operator()(const fst::StdArc& a, const fst::StdArc& b) const {
+    return true;
+  }
+};
+
+}  // namespace std
+
 namespace kaldi {
 
 struct LatticeFasterInterpLmDecoderConfig {
@@ -44,45 +68,44 @@ struct LatticeFasterInterpLmDecoderConfig {
   int32 min_active;
   BaseFloat lattice_beam;
   int32 prune_interval;
-  bool determinize_lattice; // not inspected by this class... used in
-                            // command-line program.
-  BaseFloat beam_delta; // has nothing to do with beam_ratio
+  bool determinize_lattice;  // not inspected by this class... used in
+                             // command-line program.
+  BaseFloat beam_delta;      // has nothing to do with beam_ratio
   BaseFloat hash_ratio;
-  BaseFloat prune_scale;   // Note: we don't make this configurable on the command line,
-                           // it's not a very important parameter.  It affects the
-                           // algorithm that prunes the tokens as we go.
+  BaseFloat prune_scale;     // Note: we don't make this configurable on the
+                             // command line, it's not a very important
+                             // parameter.  It affects the algorithm that
+                             // prunes the tokens as we go.
   // Most of the options inside det_opts are not actually queried by the
-  // LatticeFasterDecoder class itself, but by the code that calls it, for
-  // example in the function DecodeUtteranceLatticeFaster.
+  // LatticeFasterInterpLMDecoder class itself, but by the code that calls it,
+  // for example in the function DecodeUtteranceLatticeFaster.
   fst::DeterminizeLatticePhonePrunedOptions det_opts;
 
-  LatticeFasterDecoderConfig(): alpha(0.5),
-                                beam(16.0),
-                                max_active(std::numeric_limits<int32>::max()),
-                                min_active(200),
-                                lattice_beam(10.0),
-                                prune_interval(25),
-                                determinize_lattice(true),
-                                beam_delta(0.5),
-                                hash_ratio(2.0),
-                                prune_scale(0.1) { }
+  LatticeFasterInterpLmDecoderConfig():
+      alpha(0.5), beam(16.0), max_active(std::numeric_limits<int32>::max()),
+      min_active(200), lattice_beam(10.0), prune_interval(25),
+      determinize_lattice(true), beam_delta(0.5), hash_ratio(2.0),
+      prune_scale(0.1) { }
+
   void Register(OptionsItf *opts) {
     det_opts.Register(opts);
     opts->Register("alpha", &alpha, "Linear interpolation weight.");
     opts->Register("beam", &beam, "Decoding beam.");
     opts->Register("max-active", &max_active, "Decoder max active states.");
-    opts->Register("min-active", &min_active, "Decoder minimum #active states.");
+    opts->Register("min-active", &min_active,
+                   "Decoder minimum #active states.");
     opts->Register("lattice-beam", &lattice_beam, "Lattice generation beam");
-    opts->Register("prune-interval", &prune_interval, "Interval (in frames) at "
-                   "which to prune tokens");
+    opts->Register("prune-interval", &prune_interval,
+                   "Interval (in frames) at which to prune tokens");
     opts->Register("determinize-lattice", &determinize_lattice, "If true, "
                    "determinize the lattice (in a special sense, keeping only "
                    "best pdf-sequence for each word-sequence).");
-    opts->Register("beam-delta", &beam_delta, "Increment used in decoding-- this "
-                   "parameter is obscure and relates to a speedup in the way the "
-                   "max-active constraint is applied.  Larger is more accurate.");
-    opts->Register("hash-ratio", &hash_ratio, "Setting used in decoder to control"
-                   " hash behavior");
+    opts->Register("beam-delta", &beam_delta,
+                   "Increment used in decoding-- this parameter is obscure and "
+                   "relates to a speedup in the way the max-active constraint "
+                   "is applied.  Larger is more accurate.");
+    opts->Register("hash-ratio", &hash_ratio,
+                   "Setting used in decoder to control hash behavior");
   }
   void Check() const {
     KALDI_ASSERT(alpha >= 0.0 && alpha <= 1.0 && beam > 0.0 && max_active > 1 &&
@@ -104,8 +127,8 @@ class LatticeFasterInterpLmDecoder {
   typedef Arc::Weight Weight;
   typedef fst::Fst<Arc> Fst;
   // instantiate this class once for each thing you have to decode.
-  LatticeFasterInterpLmDecoder(const Fst &hcl, const Fst &lm1, const Fst &lm2,
-                               const LatticeFasterInterpLmDecoderConfig &config);
+  LatticeFasterInterpLmDecoder(const LatticeFasterInterpLmDecoderConfig &config,
+                               const Fst &hcl, const Fst &lm1, const Fst &lm2);
 
   // This version of the initializer "takes ownership" of the fst,
   // and will delete it when this object is destroyed.
@@ -113,7 +136,7 @@ class LatticeFasterInterpLmDecoder {
                                const Fst *hcl, const Fst *lm1, const Fst *lm2);
 
 
-  void SetOptions(const LatticeFasterDecoderConfig &config) {
+  void SetOptions(const LatticeFasterInterpLmDecoderConfig &config) {
     config_ = config;
   }
 
@@ -121,7 +144,7 @@ class LatticeFasterInterpLmDecoder {
     return config_;
   }
 
-  ~LatticeFasterDecoder();
+  ~LatticeFasterInterpLmDecoder();
 
   /// Decodes until there are no more frames left in the "decodable" object..
   /// note, this may block waiting for input if the "decodable" object blocks.
@@ -252,7 +275,7 @@ class LatticeFasterInterpLmDecoder {
     ForwardLink *next; // next in singly-linked list of forward links from a
                        // token.
     inline ForwardLink(Token *next_tok, Label ilabel, Label olabel,
-                       BaseFloat aco_cost, Basefloat hcl_cost,
+                       BaseFloat aco_cost, BaseFloat hcl_cost,
                        BaseFloat lm1_cost, BaseFloat lm2_cost,
                        ForwardLink *next):
         next_tok(next_tok), ilabel(ilabel), olabel(olabel),
@@ -295,6 +318,10 @@ class LatticeFasterInterpLmDecoder {
       links = NULL;
     }
 
+    inline BaseFloat AcousticCost() const {
+      return tot_cost - hcl_cost - LMCost();
+    }
+
     inline BaseFloat LMCost() const {
       return -kaldi::LogAdd(-lm1_cost, -lm2_cost);
     }
@@ -322,10 +349,9 @@ class LatticeFasterInterpLmDecoder {
   // index plus one, which is used to index into the active_toks_ array.
   // Returns the Token pointer.  Sets "changed" (if non-NULL) to true if the
   // token was newly created or the cost changed.
-  inline Token *FindOrAddToken(StateTriplet state, int32 frame_plus_one,
-                               BaseFloat aco_cost, BaseFloat hcl_cost,
-                               BaseFloat lm1_cost, BaseFloat lm2_cost,
-                               bool *changed);
+  Token *FindOrAddToken(StateTriplet state, int32 frame_plus_one,
+                        BaseFloat tot_cost, BaseFloat hcl_cost,
+                        BaseFloat lm1_cost, BaseFloat lm2_cost, bool *changed);
 
   // prunes outgoing links for all tokens in active_toks_[frame]
   // it's called by PruneActiveTokens
@@ -500,7 +526,7 @@ class LatticeFasterInterpLmDecoder {
       int32 frame, Label olabel, BaseFloat tot_cost, BaseFloat hcl_cost,
       BaseFloat lm1_cost, BaseFloat lm2_cost, BaseFloat hcl_arc_w,
       BaseFloat lm1_arc_w, BaseFloat lm2_arc_w, BaseFloat cutoff) {
-    if (tot_cost >= cutoff) continue;
+    if (tot_cost >= cutoff) return;
     const StateTriplet new_state(next_hcl, next_lm1, next_lm2);
     bool changed;
     Token *new_tok = FindOrAddToken(
@@ -512,8 +538,6 @@ class LatticeFasterInterpLmDecoder {
 
   KALDI_DISALLOW_COPY_AND_ASSIGN(LatticeFasterInterpLmDecoder);
 };
-
-
 
 } // end namespace kaldi.
 

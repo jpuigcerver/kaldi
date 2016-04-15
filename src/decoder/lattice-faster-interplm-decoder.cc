@@ -31,31 +31,27 @@ namespace kaldi {
 
 // instantiate this class once for each thing you have to decode.
 LatticeFasterInterpLmDecoder::LatticeFasterInterpLmDecoder(
-    const fst::Fst<fst::StdArc> &hcl,
-    const fst::Fst<fst::StdArc> &lm1,
-    const fst::Fst<fst::StdArc> &lm2,
-    const LatticeFasterInterpLmDecoderConfig &config):
+    const LatticeFasterInterpLmDecoderConfig &config,
+    const Fst& hcl, const Fst& lm1, const Fst& lm2):
     hcl_(hcl), lm1_(lm1), lm2_(lm2),
-    matcher1_(lm1_, MATCH_INPUT, 1), matcher2_(lm2_, MATCH_INPUT, 1),
+    matcher1_(lm1_, fst::MATCH_INPUT, 1), matcher2_(lm2_, fst::MATCH_INPUT, 1),
     delete_fst_(false), config_(config), num_toks_(0) {
   config.Check();
   toks_.SetSize(1000);  // just so on the first frame we do something reasonable.
-  KALDI_ASSERT(lm1_.Properties(kILabelSorted, true));
-  KALDI_ASSERT(lm2_.Properties(kILabelSorted, true));
+  KALDI_ASSERT(lm1_.Properties(fst::kILabelSorted, true) == fst::kILabelSorted);
+  KALDI_ASSERT(lm2_.Properties(fst::kILabelSorted, true) == fst::kILabelSorted);
 }
 
 LatticeFasterInterpLmDecoder::LatticeFasterInterpLmDecoder(
     const LatticeFasterInterpLmDecoderConfig &config,
-    fst::Fst<fst::StdArc> *hcl,
-    fst::Fst<fst::StdArc> *lm1,
-    fst::Fst<fst::StdArc> *lm2) :
+    const Fst* hcl, const Fst* lm1, const Fst* lm2) :
     hcl_(*hcl), lm1_(*lm1), lm2_(*lm2),
-    matcher1_(lm1_, MATCH_INPUT, 1), matcher2_(lm2_, MATCH_INPUT, 1),
+    matcher1_(lm1_, fst::MATCH_INPUT, 1), matcher2_(lm2_, fst::MATCH_INPUT, 1),
     delete_fst_(true), config_(config), num_toks_(0) {
   config.Check();
   toks_.SetSize(1000);  // just so on the first frame we do something reasonable.
-  KALDI_ASSERT(lm1_.Properties(kILabelSorted, true));
-  KALDI_ASSERT(lm2_.Properties(kILabelSorted, true));
+  KALDI_ASSERT(lm1_.Properties(fst::kILabelSorted, true) == fst::kILabelSorted);
+  KALDI_ASSERT(lm2_.Properties(fst::kILabelSorted, true) == fst::kILabelSorted);
 }
 
 
@@ -102,7 +98,6 @@ bool LatticeFasterInterpLmDecoder::Decode(DecodableInterface *decodable) {
   // We use 1-based indexing for frames in this decoder (if you view it in
   // terms of features), but note that the decodable object uses zero-based
   // numbering, which we have to correct for when we call it.
-
   while (!decodable->IsLastFrame(NumFramesDecoded() - 1)) {
     if (NumFramesDecoded() % config_.prune_interval == 0)
       PruneActiveTokens(config_.lattice_beam * config_.prune_scale);
@@ -198,8 +193,7 @@ bool LatticeFasterInterpLmDecoder::GetRawLattice(Lattice *ofst,
                             -(tok->lm2_cost + l->lm2_cost))) - tok->LMCost();
         // Graph cost = HCL cost of ForwardLink + LM cost of ForwardLink
         Arc arc(l->ilabel, l->olabel,
-                LatticeWeight(l->hcl_cost + lm_cost,
-                              l->acoustic_cost - cost_offset),
+                LatticeWeight(l->hcl_cost + lm_cost, l->aco_cost - cost_offset),
                 nextstate);
         ofst->AddArc(cur_state, arc);
       }
@@ -223,7 +217,7 @@ bool LatticeFasterInterpLmDecoder::GetRawLattice(Lattice *ofst,
 // the LatticeFasterInterpLmDecoder class.  Outputs an FST corresponding to the
 // lattice-determinized lattice (one path per word sequence).
 bool LatticeFasterInterpLmDecoder::GetLattice(CompactLattice *ofst,
-                                      bool use_final_probs) const {
+                                              bool use_final_probs) const {
   Lattice raw_fst;
   GetRawLattice(&raw_fst, use_final_probs);
   Invert(&raw_fst);  // make it so word labels are on the input.
@@ -257,11 +251,10 @@ void LatticeFasterInterpLmDecoder::PossiblyResizeHash(size_t num_toks) {
 // for the current frame.  [note: it's inserted if necessary into hash toks_
 // and also into the singly linked list of tokens active on this frame
 // (whose head is at active_toks_[frame]).
-inline LatticeFasterInterpLmDecoder::Token*
+LatticeFasterInterpLmDecoder::Token*
 LatticeFasterInterpLmDecoder::FindOrAddToken(
     StateTriplet state, int32 frame_plus_one, BaseFloat tot_cost,
-    BaseFloat hcl_cost, BaseFloat lm1_cost, BaseFloat lm2_cost,
-    bool *changed) {
+    BaseFloat hcl_cost, BaseFloat lm1_cost, BaseFloat lm2_cost, bool *changed) {
   // Returns the Token pointer.  Sets "changed" (if non-NULL) to true
   // if the token was newly created or the cost changed.
   KALDI_ASSERT(frame_plus_one < active_toks_.size());
@@ -306,8 +299,8 @@ LatticeFasterInterpLmDecoder::FindOrAddToken(
 // it's called by PruneActiveTokens all links, that have
 // link_extra_cost > lattice_beam are pruned
 void LatticeFasterInterpLmDecoder::PruneForwardLinks(
-    int32 frame_plus_one, bool *extra_costs_changed,
-    bool *links_pruned, BaseFloat delta) {
+    int32 frame_plus_one, bool *extra_costs_changed, bool *links_pruned,
+    BaseFloat delta) {
   // delta is the amount by which the extra_costs must change
   // If delta is larger,  we'll tend to go back less far
   //    toward the beginning of the file.
@@ -339,13 +332,16 @@ void LatticeFasterInterpLmDecoder::PruneForwardLinks(
       for (link = tok->links; link != NULL; ) {
         // See if we need to excise this link...
         Token *next_tok = link->next_tok;
-        BaseFloat link_extra_cost = next_tok->extra_cost +
-            ((tok->aco_cost + link->aco_cost + tok->hcl_cost + link->hcl_cost
-              - kaldi::LogAdd(- tok->lm1_cost - link->lm1_cost,
-                              - tok->lm2_cost - link->lm2_cost))
-             - next_tok->TotalCost());  // difference in brackets is >= 0
+        const BaseFloat link_cost =
+            tok->AcousticCost() + link->aco_cost +             // Acoustic
+            tok->hcl_cost + link->hcl_cost -                   // HCL
+            kaldi::LogAdd(-(tok->lm1_cost + link->lm1_cost),   // Interp LM
+                          -(tok->lm2_cost + link->lm2_cost));
+        // difference in brackets is >= 0
         // link_exta_cost is the difference in score between the best paths
         // through link source state and through link destination state
+        BaseFloat link_extra_cost =
+            next_tok->extra_cost + (link_cost - next_tok->tot_cost);
         KALDI_ASSERT(link_extra_cost == link_extra_cost);  // check for NaN
         if (link_extra_cost > config_.lattice_beam) {  // excise link
           ForwardLink *next_link = link->next;
@@ -404,16 +400,16 @@ void LatticeFasterInterpLmDecoder::PruneForwardLinksFinal() {
   // in topological order.  This is a modified version of the code in
   // PruneForwardLinks, but here we also take account of the final-probs.
   bool changed = true;
-  BaseFloat delta = 1.0e-05;
+  const BaseFloat delta = 1.0e-05;
   while (changed) {
     changed = false;
     for (Token *tok = active_toks_[frame_plus_one].toks;
          tok != NULL; tok = tok->next) {
       ForwardLink *link, *prev_link = NULL;
       // will recompute tok_extra_cost.  It has a term in it that corresponds
-      // to the "final-prob", so instead of initializing tok_extra_cost to infinity
-      // below we set it to the difference between the (score+final_prob) of this token,
-      // and the best such (score+final_prob).
+      // to the "final-prob", so instead of initializing tok_extra_cost to
+      // infinity below we set it to the difference between the
+      // (score+final_prob) of this token, and the best such (score+final_prob).
       BaseFloat final_cost;
       if (final_costs_.empty()) {
         final_cost = 0.0;
@@ -424,17 +420,20 @@ void LatticeFasterInterpLmDecoder::PruneForwardLinksFinal() {
         else
           final_cost = std::numeric_limits<BaseFloat>::infinity();
       }
-      BaseFloat tok_extra_cost =
-          tok->TotalCost() + final_cost - final_best_cost_;
+      BaseFloat tok_extra_cost = tok->tot_cost + final_cost - final_best_cost_;
       // tok_extra_cost will be a "min" over either directly being final, or
       // being indirectly final through other links, and the loop below may
       // decrease its value:
       for (link = tok->links; link != NULL; ) {
         // See if we need to excise this link...
         Token *next_tok = link->next_tok;
-        BaseFloat link_extra_cost = next_tok->extra_cost +
-            ((tok->tot_cost + link->aco_cost + link->graph_cost)
-             - next_tok->tot_cost);
+        const BaseFloat link_cost =
+            tok->AcousticCost() + link->aco_cost +             // Acoustic
+            tok->hcl_cost + link->hcl_cost -                   // HCL
+            kaldi::LogAdd(-(tok->lm1_cost + link->lm1_cost),   // Interp LM
+                          -(tok->lm2_cost + link->lm2_cost));
+        BaseFloat link_extra_cost =
+            next_tok->extra_cost + (link_cost - next_tok->tot_cost);
         if (link_extra_cost > config_.lattice_beam) {  // excise link
           ForwardLink *next_link = link->next;
           if (prev_link != NULL) prev_link->next = next_link;
@@ -463,7 +462,9 @@ void LatticeFasterInterpLmDecoder::PruneForwardLinksFinal() {
 
       if (!ApproxEqual(tok->extra_cost, tok_extra_cost, delta))
         changed = true;
-      tok->extra_cost = tok_extra_cost; // will be +infinity or <= lattice_beam_.
+      tok->extra_cost = tok_extra_cost;  // will be +inf or <= lattice_beam_.
+      KALDI_ASSERT(tok->extra_cost == std::numeric_limits<BaseFloat>::infinity()
+                   || tok->extra_cost < config_.lattice_beam);
     }
   } // while changed
 }
@@ -542,8 +543,7 @@ void LatticeFasterInterpLmDecoder::PruneActiveTokens(BaseFloat delta) {
 
 void LatticeFasterInterpLmDecoder::ComputeFinalCosts(
     unordered_map<Token*, BaseFloat> *final_costs,
-    BaseFloat *final_relative_cost,
-    BaseFloat *final_best_cost) const {
+    BaseFloat *final_relative_cost, BaseFloat *final_best_cost) const {
   KALDI_ASSERT(!decoding_finalized_);
   if (final_costs != NULL)
     final_costs->clear();
@@ -554,22 +554,24 @@ void LatticeFasterInterpLmDecoder::ComputeFinalCosts(
     StateTriplet state = final_toks->key;
     Token *tok = final_toks->val;
     const Elem *next = final_toks->tail;
-    const BaseFloat cost = tok->tot_cost;
+    // Acumulated cost through HCL, including final
     const BaseFloat hcl_cost_with_final =
-        tok->hcl_cost + hcl_.Final(tok->state[0]).Value();
+        tok->hcl_cost + hcl_.Final(state[0]).Value();
+    // Acumulated cost through LM1, including final
     const BaseFloat lm1_cost_with_final =
-        tok->state[1] == fst::kNoStateId ? infinity :
-        tok->lm1_cost + lm1_.Final(tok->state[1]).Value();
+        state[1] == fst::kNoStateId ? infinity :
+        tok->lm1_cost + lm1_.Final(state[1]).Value();
+    // Acumulated cost through LM2, including final
     const BaseFloat lm2_cost_with_final =
-        tok->state[2] == fst::kNoStateId ? infinity :
-        tok->lm2_cost + lm2_.Final(tok->state[2]).Value();
-    // TODO
-    const BaseFloat tot_cost_with_final =
-        hcl_cost_with_final - kaldi::LogAdd(-lm1_cost_with_final,
-                                            -lm2_cost_with_final);
-    const BaseFloat final_cost = TokenFinalCost(state, tok);
-    best_cost = std::min(cost, best_cost);
-    best_cost_with_final = std::min(cost_with_final, best_cost_with_final);
+        state[2] == fst::kNoStateId ? infinity :
+        tok->lm2_cost + lm2_.Final(state[2]).Value();
+    // Total acumulated cost, including final
+    const BaseFloat tot_cost_with_final = hcl_cost_with_final
+        - kaldi::LogAdd(-lm1_cost_with_final, -lm2_cost_with_final);
+    // Final weight for the token
+    const BaseFloat final_cost = tot_cost_with_final - tok->tot_cost;
+    best_cost = std::min(tok->tot_cost, best_cost);
+    best_cost_with_final = std::min(tot_cost_with_final, best_cost_with_final);
     if (final_costs != NULL && final_cost != infinity)
       (*final_costs)[tok] = final_cost;
     final_toks = next;
@@ -592,8 +594,8 @@ void LatticeFasterInterpLmDecoder::ComputeFinalCosts(
   }
 }
 
-void LatticeFasterInterpLmDecoder::AdvanceDecoding(DecodableInterface *decodable,
-                                             int32 max_num_frames) {
+void LatticeFasterInterpLmDecoder::AdvanceDecoding(
+    DecodableInterface *decodable, int32 max_num_frames) {
   KALDI_ASSERT(!active_toks_.empty() && !decoding_finalized_ &&
                "You must call InitDecoding() before AdvanceDecoding");
   int32 num_frames_ready = decodable->NumFramesReady();
@@ -767,7 +769,7 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
               const BaseFloat new_weight =
                   nolm_cost + (-kaldi::LogAdd(-lm1_cost, -lm2_cost));
               if (new_weight + adaptive_beam < next_cutoff)
-                next_cutoff = tot_cost + adaptive_beam;
+                next_cutoff = new_weight + adaptive_beam;
               // These arcs matched, so, remove them from the unmatched sets.
               lm1_unmatched_arcs_.erase(lm1_arc);
               lm2_unmatched_arcs_.erase(lm2_arc);
@@ -787,7 +789,7 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
           const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
           const BaseFloat new_weight = nolm_cost + lm2_cost;
           if (new_weight + adaptive_beam < next_cutoff)
-            next_cutoff = tot_cost + adaptive_beam;
+            next_cutoff = new_weight + adaptive_beam;
         }
         lm2_unmatched_arcs_.clear();
       }
@@ -803,7 +805,7 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
   // the tokens are now owned here, in final_toks, and the hash is empty.
   // 'owned' is a complex thing here; the point is we need to call DeleteElem
   // on each elem 'e' to let toks_ know we're done with them.
-  for (Elem *e = final_toks, *e_tail; e != NULL; e = e_tail) {
+  for (Elem *e = final_toks, *e_tail = NULL; e != NULL; e = e_tail) {
     // loop this way because we delete "e" as we go.
     const StateTriplet curr_state = e->key;
     Token *tok = e->val;
@@ -836,7 +838,7 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
           for (const Arc& lm1_arc : lm1_arcs_) {
             const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
             for (const Arc& lm2_arc : lm2_arcs_) {
-              if (lm1_arcs.olabel != lm2_arc.olabel) continue;
+              if (lm1_arc.olabel != lm2_arc.olabel) continue;
               lm1_unmatched_arcs_.erase(lm1_arc);
               lm2_unmatched_arcs_.erase(lm2_arc);
               const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
@@ -912,7 +914,7 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
     const StateTriplet curr_state = queue_.back();
     queue_.pop_back();
 
-    Token *tok = toks_.Find(state)->val;
+    Token *tok = toks_.Find(curr_state)->val;
     if (tok->tot_cost >= cutoff) continue;
 
     // If "tok" has any existing forward links, delete them,
@@ -966,7 +968,7 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
         // Process unmatched arcs from LM1
         for (const Arc& lm1_arc : lm1_unmatched_arcs_) {
           const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
-          const BaseFloat tot_cost = tmp_cost + lm1_cost;
+          const BaseFloat tot_cost = nolm_cost + lm1_cost;
           AddNonemittingToken(tok, hcl_arc.nextstate, lm1_arc.nextstate,
                               fst::kNoStateId, frame, lm1_arc.olabel,
                               tot_cost, hcl_cost, lm1_cost,
@@ -978,7 +980,7 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
         // Process unmatched arcs from LM2
         for (const Arc& lm2_arc : lm2_unmatched_arcs_) {
           const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
-          const BaseFloat tot_cost = tmp_cost + lm2_cost;
+          const BaseFloat tot_cost = nolm_cost + lm2_cost;
           AddNonemittingToken(tok, hcl_arc.nextstate, fst::kNoStateId,
                               lm2_arc.nextstate, frame, lm2_arc.olabel,
                               tot_cost, hcl_cost, Weight::Zero().Value(),
@@ -991,40 +993,44 @@ void LatticeFasterInterpLmDecoder::ProcessNonemitting(BaseFloat cutoff) {
     } // for all arcs with input epsilon in HCL
 
     // Process all arcs with input epsilon in LM1
-    for (fst::ArcIterator<Fst> lm1_aiter(lm1_, curr_state[1]);
-         !lm1_aiter.Done(); lm1_aiter.Next()) {
-      const Arc& lm1_arc = lm1_aiter.Value();
-      if (lm1_arc.ilabel != 0) continue;
-      const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
-      const BaseFloat lm2_cost = tok->lm2_cost;
-      const BaseFloat tot_cost =
-          tok->tot_cost - tok->LMCost() - kaldi::LogAdd(-lm1_cost, -lm2_cost);
-      AddNonemittingToken(tok, curr_state[0], lm1_arc.nextstate, curr_state[2],
-                          frame, lm1_arc.olabel, tot_cost, 0.0,
-                          lm1_cost, lm2_cost, 0.0, lm1_arc.weight.Value(), 0.0,
-                          cutoff);
+    if (curr_state[1] != fst::kNoStateId) {
+      for (fst::ArcIterator<Fst> lm1_aiter(lm1_, curr_state[1]);
+           !lm1_aiter.Done(); lm1_aiter.Next()) {
+        const Arc& lm1_arc = lm1_aiter.Value();
+        if (lm1_arc.ilabel != 0) continue;
+        const BaseFloat lm1_cost = tok->lm1_cost + lm1_arc.weight.Value();
+        const BaseFloat lm2_cost = tok->lm2_cost;
+        const BaseFloat tot_cost =
+            tok->tot_cost - tok->LMCost() - kaldi::LogAdd(-lm1_cost, -lm2_cost);
+        AddNonemittingToken(
+            tok, curr_state[0], lm1_arc.nextstate, curr_state[2], frame,
+            lm1_arc.olabel, tot_cost, 0.0, lm1_cost, lm2_cost, 0.0,
+            lm1_arc.weight.Value(), 0.0, cutoff);
+      }
     }
 
     // Process all arcs with input epsilon in LM2
-    for (fst::ArcIterator<Fst> lm2_aiter(lm2_, curr_state[2]);
-         !lm2_aiter.Done(); lm2_aiter.Next()) {
-      const Arc& lm2_arc = lm2_aiter.Value();
-      if (lm2_arc.ilabel != 0) continue;
-      const BaseFloat lm1_cost = tok->lm1_cost;
-      const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
-      const BaseFloat tot_cost =
-          tok->tot_cost - tok->LMCost() - kaldi::LogAdd(-lm1_cost, -lm2_cost);
-      AddNonemittingToken(tok, curr_state[0], curr_state[1], lm2_arc.nextstate,
-                          frame, lm2_arc.olabel, tot_cost, 0.0,
-                          lm1_cost, lm2_cost, 0.0, 0.0, lm2_arc.weight.Value(),
-                          cutoff);
+    if (curr_state[2] != fst::kNoStateId) {
+      for (fst::ArcIterator<Fst> lm2_aiter(lm2_, curr_state[2]);
+           !lm2_aiter.Done(); lm2_aiter.Next()) {
+        const Arc& lm2_arc = lm2_aiter.Value();
+        if (lm2_arc.ilabel != 0) continue;
+        const BaseFloat lm1_cost = tok->lm1_cost;
+        const BaseFloat lm2_cost = tok->lm2_cost + lm2_arc.weight.Value();
+        const BaseFloat tot_cost =
+            tok->tot_cost - tok->LMCost() - kaldi::LogAdd(-lm1_cost, -lm2_cost);
+        AddNonemittingToken(
+            tok, curr_state[0], curr_state[1], lm2_arc.nextstate,
+            frame, lm2_arc.olabel, tot_cost, 0.0,
+            lm1_cost, lm2_cost, 0.0, 0.0, lm2_arc.weight.Value(), cutoff);
+      }
     }
   } // while queue not empty
 }
 
 
 void LatticeFasterInterpLmDecoder::DeleteElems(Elem *list) {
-  for (Elem *e = list, *e_tail; e != NULL; e = e_tail) {
+  for (Elem *e = list, *e_tail = NULL; e != NULL; e = e_tail) {
     e_tail = e->tail;
     toks_.Delete(e);
   }
@@ -1130,9 +1136,11 @@ void LatticeFasterInterpLmDecoder::FindILabelArcs(
   KALDI_ASSERT(m != NULL);
   KALDI_ASSERT(arcs != NULL);
   arcs->clear();
-  m->SetState(s);
-  for(m->Find(l); !m->Done(); m->Next()) {
-    arcs->push_back(m->Value());
+  if (s != fst::kNoStateId) {
+    m->SetState(s);
+    for(m->Find(l); !m->Done(); m->Next()) {
+      arcs->push_back(m->Value());
+    }
   }
 }
 
