@@ -1,24 +1,37 @@
 #include "base/kaldi-common.h"
 #include "util/common-utils.h"
 #include "fstext/kaldi-fst-io.h"
+#include "lat/kaldi-lattice.h"
+#include "lat/lattice-functions.h"
 
 namespace kaldi {
 
-void AddInsPenToLattice(BaseFloat ins_penalty, Lattice *lat,
-                        bool add_when_output = true) {
+void AddInsPenToLattice(BaseFloat penalty, Lattice *lat,
+                        bool output_penalty = true) {
   for (int32 state = 0; state < lat->NumStates(); ++state) {
     for (fst::MutableArcIterator<Lattice> aiter(lat, state); !aiter.Done();
          aiter.Next()) {
       LatticeArc arc(aiter.Value());
-      if ((add_when_output && arc.olabel != 0) ||
-          (!add_when_output && arc.ilabel != 0)) {
-        LatticeWeight weight = arc.weight.Weight();
-        weight.SetValue1(weight.Value1() + ins_penalty);
-        arc.weight.SetWeight(weight);
+      if ((output_penalty && arc.olabel != 0) ||
+          (!output_penalty && arc.ilabel != 0)) {
+        LatticeWeight weight = arc.weight;
+        weight.SetValue1(weight.Value1() + penalty);
+        arc.weight = weight;
         aiter.SetValue(arc);
       }
     }
   }
+}
+
+template <typename Arc>
+double ComputeLikelihood(const fst::Fst<Arc>& fst) {
+  std::vector<typename Arc::Weight> state_likelihoods;
+  fst::ShortestDistance(fst, &state_likelihoods);
+  typename Arc::Weight total_likelihood = Arc::Weight::Zero();
+  for (typename Arc::StateId s = 0; s < state_likelihoods.size(); ++s) {
+    total_likelihood = fst::Times(total_likelihood, state_likelihoods[s]);
+  }
+  return total_likelihood.Value();
 }
 
 }  // namespace kaldi
@@ -65,22 +78,46 @@ int main(int argc, char *argv[]) {
         (ClassifyRspecifier(query_in_str, NULL, NULL) != kNoRspecifier);
 
 
+    std::vector<fst::VectorFst<fst::StdArc>*> query_std_fsts;
+    std::vector<fst::VectorFst<fst::LogArc>*> query_log_fsts;
+    std::vector<std::string> query_keys;
     if (query_is_table) {
-      SequentialAccessTableReader<fst::VectorFstHolder> query_reader(
-          query_in_str);
+      SequentialTableReader<fst::VectorFstHolder> query_reader(query_in_str);
       for (; !query_reader.Done(); query_reader.Next()) {
-        const std::string key = query_reader.Key();
-        const fst::VectorFst<StdArc> fst = query_reader.Value();
+        query_keys.push_back(query_reader.Key());
+        if (use_log) {
+          query_log_fsts.push_back(new fst::VectorFst<fst::LogArc>());
+          fst::ArcMap(query_reader.Value(), query_log_fsts.back(),
+                      fst::WeightConvertMapper<fst::StdArc, fst::LogArc>());
+        } else {
+          query_std_fsts.push_back(new fst::VectorFst<fst::StdArc>());
+          *query_std_fsts.back() = query_reader.Value();
+        }
         query_reader.FreeCurrent();
       }
     } else {
+      if (use_log) {
+        fst::VectorFst<fst::StdArc> tmp;
+        fst::ReadFstKaldi(query_in_str, &tmp);
+        query_log_fsts.push_back(new fst::VectorFst<fst::LogArc>());
+        fst::ArcMap(tmp, query_log_fsts.back(),
+                    fst::WeightConvertMapper<fst::StdArc, fst::LogArc>());
+        fst::ArcSort(query_log_fsts.back(), fst::ILabelCompare<fst::LogArc>());
+      } else {
+        query_std_fsts.push_back(new fst::VectorFst<fst::StdArc>());
+        fst::ReadFstKaldi(query_in_str, query_std_fsts.back());
+        fst::ArcSort(query_std_fsts.back(), fst::ILabelCompare<fst::StdArc>());
+      }
     }
+
+    kaldi::TableWriter<kaldi::BasicHolder<double>> table_writer;
 
     if (lattice_is_table) {
       SequentialLatticeReader lattice_reader;
       for (; !lattice_reader.Done(); lattice_reader.Next()) {
-        const std::string key = lattice_reader.Key();
-        fst::VectorFst<StdArc> fst;
+        const std::string lattice_key = lattice_reader.Key();
+        fst::VectorFst<fst::StdArc> lattice_std_fst;
+        fst::VectorFst<fst::LogArc> lattice_log_fst;
         {
           Lattice lat = lattice_reader.Value();
           lattice_reader.FreeCurrent();
@@ -89,143 +126,49 @@ int main(int argc, char *argv[]) {
             fst::ScaleLattice(fst::AcousticLatticeScale(acoustic_scale), &lat);
           // Word insertion penalty
           if (insertion_penalty != 0.0)
-            kaldi::AddInsPenToLattice(insertion_penalty, &lat);
+            AddInsPenToLattice(insertion_penalty, &lat);
           // Lattice prunning
           if (beam != std::numeric_limits<BaseFloat>::infinity())
-            fst::PruneLattice(beam, &lat);
+            PruneLattice(beam, &lat);
           // Convert lattice to FST
-          fst::ConvertLattice(lat, &fst);
-        }
-
-
-      }
-
-    } else {
-
-    }
-
-
-
-
-
-
-
-
-    RandomAccessTableReader< VectorFstTplHolder<Arc> > index_reader(index_rspecifier);
-    SequentialTableReader<VectorFstHolder> keyword_reader(keyword_rspecifier);
-    TableWriter<BasicVectorHolder<double> > result_writer(result_wspecifier);
-
-    // Index has key "global"
-    KwsLexicographicFst index = index_reader.Value("global");
-
-    // First we have to remove the disambiguation symbols. But rather than
-    // removing them totally, we actually move them from input side to output
-    // side, making the output symbol a "combined" symbol of the disambiguation
-    // symbols and the utterance id's.
-    // Note that in Dogan and Murat's original paper, they simply remove the
-    // disambiguation symbol on the input symbol side, which will not allow us
-    // to do epsilon removal after composition with the keyword FST. They have
-    // to traverse the resulting FST.
-    int32 label_count = 1;
-    unordered_map<uint64, uint32> label_encoder;
-    unordered_map<uint32, uint64> label_decoder;
-    for (StateIterator<KwsLexicographicFst> siter(index); !siter.Done(); siter.Next()) {
-      StateId state_id = siter.Value();
-      for (MutableArcIterator<KwsLexicographicFst>
-           aiter(&index, state_id); !aiter.Done(); aiter.Next()) {
-        Arc arc = aiter.Value();
-        // Skip the non-final arcs
-        if (index.Final(arc.nextstate) == Weight::Zero())
-          continue;
-        // Encode the input and output label of the final arc, and this is the
-        // new output label for this arc; set the input label to <epsilon>
-        uint64 osymbol = EncodeLabel(arc.ilabel, arc.olabel);
-        arc.ilabel = 0;
-        if (label_encoder.find(osymbol) == label_encoder.end()) {
-          arc.olabel = label_count;
-          label_encoder[osymbol] = label_count;
-          label_decoder[label_count] = osymbol;
-          label_count++;
-        } else {
-          arc.olabel = label_encoder[osymbol];
-        }
-        aiter.SetValue(arc);
-      }
-    }
-    ArcSort(&index, fst::ILabelCompare<Arc>());
-
-    int32 n_done = 0;
-    int32 n_fail = 0;
-    for (; !keyword_reader.Done(); keyword_reader.Next()) {
-      std::string key = keyword_reader.Key();
-      VectorFst<StdArc> keyword = keyword_reader.Value();
-      keyword_reader.FreeCurrent();
-
-      // Process the case where we have confusion for keywords
-      if (keyword_beam != -1) {
-        Prune(&keyword, keyword_beam);
-      }
-      if (keyword_nbest != -1) {
-        VectorFst<StdArc> tmp;
-        ShortestPath(keyword, &tmp, keyword_nbest, true, true);
-        keyword = tmp;
-      }
-
-      KwsLexicographicFst keyword_fst;
-      KwsLexicographicFst result_fst;
-      Map(keyword, &keyword_fst, VectorFstToKwsLexicographicFstMapper());
-      Compose(keyword_fst, index, &result_fst);
-      Project(&result_fst, PROJECT_OUTPUT);
-      Minimize(&result_fst);
-      ShortestPath(result_fst, &result_fst, n_best);
-      RmEpsilon(&result_fst);
-
-      // No result found
-      if (result_fst.Start() == kNoStateId)
-        continue;
-
-      // Got something here
-      double score;
-      int32 tbeg, tend, uid;
-      for (ArcIterator<KwsLexicographicFst>
-           aiter(result_fst, result_fst.Start()); !aiter.Done(); aiter.Next()) {
-        const Arc &arc = aiter.Value();
-
-        // We're expecting a two-state FST
-        if (result_fst.Final(arc.nextstate) != Weight::One()) {
-          KALDI_WARN << "The resulting FST does not have the expected structure for key " << key;
-          n_fail++;
-          continue;
-        }
-
-        uint64 osymbol = label_decoder[arc.olabel];
-        uid = (int32)DecodeLabelUid(osymbol);
-        tbeg = arc.weight.Value2().Value1().Value();
-        tend = arc.weight.Value2().Value2().Value();
-        score = arc.weight.Value1().Value();
-
-        if (score < 0) {
-          if (score < negative_tolerance) {
-            KALDI_WARN << "Score out of expected range: " << score;
+          fst::ConvertLattice(lat, &lattice_std_fst);
+          if (use_log) {
+            fst::ArcMap(lattice_std_fst, &lattice_log_fst,
+                        fst::WeightConvertMapper<fst::StdArc, fst::LogArc>());
+            lattice_std_fst.DeleteStates();
+            fst::ArcSort(&lattice_log_fst, fst::OLabelCompare<fst::LogArc>());
+          } else {
+            fst::ArcSort(&lattice_std_fst, fst::OLabelCompare<fst::StdArc>());
           }
-          score = 0.0;
         }
-        vector<double> result;
-        result.push_back(uid);
-        result.push_back(tbeg);
-        result.push_back(tend);
-        result.push_back(score);
-        result_writer.Write(key, result);
+        // Compute total log-likelihood of the lattice
+        const double lattice_likelihood = use_log ?
+            ComputeLikelihood(lattice_log_fst) :
+            ComputeLikelihood(lattice_std_fst);
+        // Compute the log-likelihood of each of the queries
+        const size_t num_queries = std::max(query_log_fsts.size(),
+                                            query_std_fsts.size());
+        for (size_t i = 0; i < num_queries; ++i) {
+          const double query_likelihood = use_log ?
+              ComputeLikelihood(
+                  fst::ComposeFst<fst::LogArc>(lattice_log_fst,
+                                               *query_log_fsts[i])) :
+              ComputeLikelihood(
+                  fst::ComposeFst<fst::StdArc>(lattice_std_fst,
+                                               *query_std_fsts[i]));
+          if (i < query_keys.size()) {
+            table_writer.Write(lattice_key + "____" + query_keys[i],
+                               query_likelihood - lattice_likelihood);
+          } else {
+            table_writer.Write(lattice_key,
+                               query_likelihood - lattice_likelihood);
+          }
+        }
       }
-
-      n_done++;
+    } else {
+      KALDI_ERR << "NOT IMPLEMENTED!";
     }
-
-    KALDI_LOG << "Done " << n_done << " keywords";
-    if (strict == true)
-      return (n_done != 0 ? 0 : 1);
-    else
-      return 0;
+    return 0;
   } catch(const std::exception &e) {
     std::cerr << e.what();
     return -1;
