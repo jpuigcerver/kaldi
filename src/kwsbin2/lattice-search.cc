@@ -25,13 +25,15 @@ void AddInsPenToLattice(BaseFloat penalty, Lattice *lat,
 
 template <typename Arc>
 double ComputeLikelihood(const fst::Fst<Arc>& fst) {
+  if (fst.Start() == fst::kNoStateId)
+    return -std::numeric_limits<double>::infinity();
   std::vector<typename Arc::Weight> state_likelihoods;
   fst::ShortestDistance(fst, &state_likelihoods);
   typename Arc::Weight total_likelihood = Arc::Weight::Zero();
   for (typename Arc::StateId s = 0; s < state_likelihoods.size(); ++s) {
-    total_likelihood = fst::Times(total_likelihood, state_likelihoods[s]);
+    total_likelihood = fst::Plus(total_likelihood, state_likelihoods[s]);
   }
-  return total_likelihood.Value();
+  return -total_likelihood.Value();
 }
 
 }  // namespace kaldi
@@ -40,8 +42,14 @@ int main(int argc, char *argv[]) {
   try {
     using namespace kaldi;
 
-    const char *usage = "";
-
+    const char *usage =
+        "Search the complex queries over lattices.\n\n"
+        "Queries can be an individual FST or, more typically, a table of\n"
+        "FSTs.\n"
+        "\n"
+        "Usage: lattice-search [options] lattice-rspecifier query-rspecifier\n"
+        "  e.g.: lattice-search ark:lattices.ark ark:queries.ark\n"
+        "  e.g.: lattice-search ark:lattices.ark query.fst\n";
 
     ParseOptions po(usage);
     BaseFloat acoustic_scale = 1.0;
@@ -65,19 +73,22 @@ int main(int argc, char *argv[]) {
                 "and adding the insertion penalty).");
     po.Read(argc, argv);
 
-    if (po.NumArgs() < 3 || po.NumArgs() > 4) {
+    if (po.NumArgs() != 2) {
       po.PrintUsage();
       exit(1);
     }
 
     const std::string lattice_in_str = po.GetArg(1);
     const std::string query_in_str = po.GetArg(2);
+
     const bool lattice_is_table =
         (ClassifyRspecifier(lattice_in_str, NULL, NULL) != kNoRspecifier);
     const bool query_is_table =
         (ClassifyRspecifier(query_in_str, NULL, NULL) != kNoRspecifier);
 
 
+    fst::VectorFst<fst::StdArc> tmp_std;
+    fst::VectorFst<fst::LogArc> tmp_log;
     std::vector<fst::VectorFst<fst::StdArc>*> query_std_fsts;
     std::vector<fst::VectorFst<fst::LogArc>*> query_log_fsts;
     std::vector<std::string> query_keys;
@@ -97,23 +108,26 @@ int main(int argc, char *argv[]) {
       }
     } else {
       if (use_log) {
-        fst::VectorFst<fst::StdArc> tmp;
-        fst::ReadFstKaldi(query_in_str, &tmp);
+        fst::ReadFstKaldi(query_in_str, &tmp_std);
         query_log_fsts.push_back(new fst::VectorFst<fst::LogArc>());
-        fst::ArcMap(tmp, query_log_fsts.back(),
+        fst::ArcMap(tmp_std, query_log_fsts.back(),
                     fst::WeightConvertMapper<fst::StdArc, fst::LogArc>());
-        fst::ArcSort(query_log_fsts.back(), fst::ILabelCompare<fst::LogArc>());
+        if (query_log_fsts.back()->Properties(fst::kILabelSorted, false) !=
+            fst::kILabelSorted)
+          fst::ArcSort(query_log_fsts.back(),
+                       fst::ILabelCompare<fst::LogArc>());
       } else {
         query_std_fsts.push_back(new fst::VectorFst<fst::StdArc>());
         fst::ReadFstKaldi(query_in_str, query_std_fsts.back());
-        fst::ArcSort(query_std_fsts.back(), fst::ILabelCompare<fst::StdArc>());
+        if (query_std_fsts.back()->Properties(fst::kILabelSorted, false) !=
+            fst::kILabelSorted)
+          fst::ArcSort(query_std_fsts.back(),
+                       fst::ILabelCompare<fst::StdArc>());
       }
     }
 
-    kaldi::TableWriter<kaldi::BasicHolder<double>> table_writer;
-
     if (lattice_is_table) {
-      SequentialLatticeReader lattice_reader;
+      SequentialLatticeReader lattice_reader(lattice_in_str);
       for (; !lattice_reader.Done(); lattice_reader.Next()) {
         const std::string lattice_key = lattice_reader.Key();
         fst::VectorFst<fst::StdArc> lattice_std_fst;
@@ -136,9 +150,13 @@ int main(int argc, char *argv[]) {
             fst::ArcMap(lattice_std_fst, &lattice_log_fst,
                         fst::WeightConvertMapper<fst::StdArc, fst::LogArc>());
             lattice_std_fst.DeleteStates();
-            fst::ArcSort(&lattice_log_fst, fst::OLabelCompare<fst::LogArc>());
+            if (lattice_log_fst.Properties(fst::kOLabelSorted, false) !=
+                fst::kOLabelSorted)
+              fst::ArcSort(&lattice_log_fst, fst::OLabelCompare<fst::LogArc>());
           } else {
-            fst::ArcSort(&lattice_std_fst, fst::OLabelCompare<fst::StdArc>());
+            if (lattice_std_fst.Properties(fst::kOLabelSorted, false) !=
+                fst::kOLabelSorted)
+              fst::ArcSort(&lattice_std_fst, fst::OLabelCompare<fst::StdArc>());
           }
         }
         // Compute total log-likelihood of the lattice
@@ -149,19 +167,20 @@ int main(int argc, char *argv[]) {
         const size_t num_queries = std::max(query_log_fsts.size(),
                                             query_std_fsts.size());
         for (size_t i = 0; i < num_queries; ++i) {
-          const double query_likelihood = use_log ?
-              ComputeLikelihood(
-                  fst::ComposeFst<fst::LogArc>(lattice_log_fst,
-                                               *query_log_fsts[i])) :
-              ComputeLikelihood(
-                  fst::ComposeFst<fst::StdArc>(lattice_std_fst,
-                                               *query_std_fsts[i]));
-          if (i < query_keys.size()) {
-            table_writer.Write(lattice_key + "____" + query_keys[i],
-                               query_likelihood - lattice_likelihood);
+          double query_likelihood;
+          if (use_log) {
+            TableCompose(lattice_log_fst, *query_log_fsts[i], &tmp_log);
+            query_likelihood = ComputeLikelihood(tmp_log);
           } else {
-            table_writer.Write(lattice_key,
-                               query_likelihood - lattice_likelihood);
+            TableCompose(lattice_std_fst, *query_std_fsts[i], &tmp_std);
+            query_likelihood = ComputeLikelihood(tmp_std);
+          }
+          if (i < query_keys.size()) {
+            std::cout << lattice_key << " " << query_keys[i] << " "
+                      << query_likelihood - lattice_likelihood << std::endl;
+          } else {
+            std::cout << lattice_key << query_likelihood - lattice_likelihood
+                      << " " << std::endl;
           }
         }
       }
