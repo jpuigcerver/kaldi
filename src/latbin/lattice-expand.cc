@@ -24,127 +24,127 @@
 #include "lat/kaldi-lattice.h"
 #include "lat/lattice-functions.h"
 
-template<class Arc, class I, class O>
-void FstExpandWithBreaksRecursive(
-    const fst::Fst<Arc>& fst,
-    const std::unordered_set<typename Arc::Label>& break_labels,
-    fst::MutableFst<Arc>* ofst,
-    std::unordered_map<typename Arc::StateId,
-    typename Arc::StateId>* state_mapping,
-    std::unordered_map<std::vector<I>, typename Arc::Label,
-    kaldi::VectorHasher<I> >* isym_mapping,
-    std::unordered_map<std::vector<O>, typename Arc::Label,
-    kaldi::VectorHasher<O> >* osym_mapping,
-    std::unordered_set<typename Arc::StateId>* expanded_from,
-    typename Arc::StateId state,
-    typename Arc::StateId src_state,
-    typename Arc::Weight weight,
-    std::vector<I>* isym, std::vector<O>* osym) {
-  typedef typename Arc::StateId StateId;
-  typedef typename Arc::Label Label;
-  typedef typename Arc::Weight Weight;
-  if (isym->empty() && osym->empty())
-    expanded_from->insert(state);
+namespace fst {
 
-  for (fst::ArcIterator<fst::Fst<Arc>> aiter(fst, state); !aiter.Done();
-       aiter.Next()) {
-    const Arc& arc = aiter.Value();
-    if (break_labels.count(arc.olabel) > 0) {
-      Arc newarc(
-          isym_mapping->insert(
-              make_pair(*isym, isym_mapping->size())).first->second,
-          osym_mapping->insert(
-              make_pair(*osym, osym_mapping->size())).first->second,
-          Times(weight, arc.weight), fst::kNoStateId);
-      if (state_mapping->count(arc.nextstate) == 0)
-        newarc.nextstate = (*state_mapping)[arc.nextstate] = ofst->AddState();
-      else
-        newarc.nextstate = (*state_mapping)[arc.nextstate];
-      ofst->AddArc(src_state, newarc);
-      ofst->SetFinal(newarc.nextstate, fst.Final(arc.nextstate));
-      if (expanded_from->count(arc.nextstate) == 0) {
-        std::vector<I> tmp_inp;
-        std::vector<O> tmp_out;
-        FstExpandWithBreaksRecursive(fst, break_labels, ofst,
-                                     state_mapping, isym_mapping, osym_mapping,
-                                     expanded_from,
-                                     arc.nextstate, newarc.nextstate,
-                                     arc.weight, &tmp_inp, &tmp_out);
+template <typename Arc>
+class ExpandFstWithBreakLabels {
+ public:
+  typedef typename Arc::Label Label;
+  typedef typename Arc::StateId StateId;
+  typedef typename Arc::Weight Weight;
+  typedef StateIterator< Fst<Arc> > MyStateIterator;
+  typedef ArcIterator< Fst<Arc> > MyArcIterator;
+  typedef std::unordered_map< std::vector<Label>, Label, kaldi::VectorHasher<Label> > LabelMap;
+
+  ExpandFstWithBreakLabels(const Fst<Arc>& ifst, MutableFst<Arc>* ofst,
+                           const std::unordered_set<Label>& break_labels,
+                           const bool break_input = false) :
+      ifst_(ifst), ofst_(ofst), break_labels_(break_labels), break_input_(break_input) {
+    KALDI_ASSERT(ofst_ != NULL);
+    Expand();
+  }
+
+  inline const LabelMap& InputMap() const { return isym_map_; }
+
+  inline const LabelMap& OutputMap() const { return osym_map_; }
+
+ private:
+  const Fst<Arc>& ifst_;
+  MutableFst<Arc>* ofst_;
+  const std::unordered_set<Label>& break_labels_;
+  const bool break_input_;
+  std::unordered_set<StateId> expanded_from_;
+  LabelMap isym_map_;
+  LabelMap osym_map_;
+
+  static Label FindOrAssignLabel(const std::vector<Label>& v, LabelMap* m) {
+    KALDI_ASSERT(m != NULL);
+    return m->insert(std::make_pair(v, m->size())).first->second;
+  }
+
+  void Expand() {
+    ofst_->DeleteStates();
+    if (ifst_.Start() < 0) return;
+
+    // Output FST will have as many states as the input FST.
+    // NOTE: We require that all final states have no output arcs.
+    for (MyStateIterator siter(ifst_); !siter.Done(); siter.Next()) {
+      const StateId s = siter.Value();
+      KALDI_ASSERT(ifst_.Final(s) == Weight::Zero() || ifst_.NumArcs(s) == 0);
+      ofst_->SetFinal(ofst_->AddState(), ifst_.Final(s));
+    }
+
+    // Initialize symbols table with epsilons
+    isym_map_[std::vector<Label>()] = 0;
+    osym_map_[std::vector<Label>()] = 0;
+
+    // Add arcs to the output FST which are labeled with any of the break symbols.
+    // It also adds the corresponding symbols to the SymbolMap tables.
+    // NOTE: Some of these arcs may be unreachable once the whole input FST is
+    // expanded, that's why we trim the output FST later.
+    for (MyStateIterator siter(ifst_); !siter.Done(); siter.Next()) {
+      for (MyArcIterator aiter(ifst_, siter.Value()); !aiter.Done(); aiter.Next()) {
+        Arc arc = aiter.Value();
+        if (break_labels_.count(break_input_ ? arc.ilabel : arc.olabel) > 0) {
+          if (arc.ilabel != 0)
+            arc.ilabel = FindOrAssignLabel(std::vector<Label>(1, arc.ilabel), &isym_map_);
+          if (arc.olabel != 0)
+            arc.olabel = FindOrAssignLabel(std::vector<Label>(1, arc.olabel), &osym_map_);
+          ofst_->AddArc(siter.Value(), arc);
+        }
       }
+    }
+
+    // Start expansion from the initial state
+    expanded_from_.insert(ifst_.Start());
+    std::vector<Label> tmp_isym, tmp_osym;
+    Weight tmp_w = Weight::One();
+    ofst_->SetStart(ifst_.Start());
+    ExpandFromState(ofst_->Start(), ifst_.Start(), &tmp_w, &tmp_isym, &tmp_osym);
+
+    // Connect output FST to remove unnecessary states and arcs.
+    Connect(ofst_);
+  }
+
+  // Expand path from state s to t, with the current weight and sequence of
+  // input/output labels.
+  // Note: Weight and input/output labels are passed as reference to avoid
+  // extra memory during recursion.
+  void ExpandFromState(StateId s, StateId t, Weight* w,
+                       std::vector<Label>* isym, std::vector<Label>* osym) {
+    if (ifst_.Final(t) != Weight::Zero()) {
+      Arc newarc(FindOrAssignLabel(*isym, &isym_map_),
+                 FindOrAssignLabel(*osym, &osym_map_), *w, t);
+      ofst_->AddArc(s, newarc);
     } else {
-      if (fst.Final(arc.nextstate) != Weight::Zero()) {
-        Arc newarc(
-            isym_mapping->insert(
-                make_pair(*isym, isym_mapping->size())).first->second,
-            osym_mapping->insert(
-                make_pair(*osym, osym_mapping->size())).first->second,
-            Times(weight, arc.weight), fst::kNoStateId);
-        if (state_mapping->count(arc.nextstate) == 0)
-          newarc.nextstate = (*state_mapping)[arc.nextstate] = ofst->AddState();
-        else
-          newarc.nextstate = (*state_mapping)[arc.nextstate];
-        ofst->AddArc(src_state, newarc);
-        ofst->SetFinal(newarc.nextstate, fst.Final(arc.nextstate));
-        src_state = newarc.nextstate;
+      for (MyArcIterator aiter(ifst_, t); !aiter.Done(); aiter.Next()) {
+        const Arc& arc = aiter.Value();
+        if (break_labels_.count(break_input_ ? arc.ilabel : arc.olabel) > 0) {
+          Arc newarc(FindOrAssignLabel(*isym, &isym_map_),
+                     FindOrAssignLabel(*osym, &osym_map_), *w, t);
+          ofst_->AddArc(s, newarc);
+          if (expanded_from_.count(arc.nextstate) == 0) {
+            expanded_from_.insert(arc.nextstate);
+            std::vector<Label> tmp_isym, tmp_osym;
+            Weight tmp_w = Weight::One();
+            ExpandFromState(arc.nextstate, arc.nextstate, &tmp_w, &tmp_isym, &tmp_osym);
+          }
+        } else {
+          if (arc.ilabel != 0) isym->push_back(arc.ilabel);
+          if (arc.olabel != 0) osym->push_back(arc.olabel);
+          *w = Times(*w, arc.weight);
+          ExpandFromState(s, arc.nextstate, w, isym, osym);
+          *w = Divide(*w, arc.weight, DIVIDE_RIGHT);
+          if (arc.ilabel != 0) isym->pop_back();
+          if (arc.olabel != 0) osym->pop_back();
+        }
       }
-      if (arc.ilabel != 0) isym->push_back(arc.ilabel);
-      if (arc.olabel != 0) osym->push_back(arc.olabel);
-      FstExpandWithBreaksRecursive(fst, break_labels, ofst,
-                                   state_mapping, isym_mapping, osym_mapping,
-                                   expanded_from,
-                                   arc.nextstate, src_state,
-                                   Times(weight, arc.weight), isym, osym);
-      if (arc.ilabel != 0) isym->pop_back();
-      if (arc.olabel != 0) osym->pop_back();
     }
   }
-}
+};
 
-template<class Arc, class I, class O>
-void FstExpandWithBreaks(
-    const fst::Fst<Arc>& fst,
-    const std::unordered_set<typename Arc::Label>& break_labels,
-    fst::MutableFst<Arc>* ofst,
-    std::vector< std::vector<I> >* symbols_inp,
-    std::vector< std::vector<O> >* symbols_out) {
-  typedef typename Arc::StateId StateId;
-  typedef typename Arc::Label Label;
-  typedef typename Arc::Weight Weight;
-  KALDI_ASSERT_IS_INTEGER_TYPE(I);
-  KALDI_ASSERT_IS_INTEGER_TYPE(O);
-  KALDI_ASSERT(ofst != NULL);
-  ofst->DeleteStates();
-  if (fst.Start() < 0) return;
+}  // namespace fst
 
-  std::unordered_map<StateId, StateId> state_mapping;
-  std::unordered_map<std::vector<I>, Label, kaldi::VectorHasher<I>>
-      isym_mapping;
-  std::unordered_map<std::vector<O>, Label, kaldi::VectorHasher<O>>
-      osym_mapping;
-  std::unordered_set<StateId> expanded_from;
-  ofst->SetStart(ofst->AddState());
-  state_mapping[fst.Start()] = ofst->Start();
-  isym_mapping[std::vector<I>()] = 0;
-  osym_mapping[std::vector<O>()] = 0;
-
-  std::vector<I> tmp_inp;
-  std::vector<O> tmp_out;
-  FstExpandWithBreaksRecursive(fst, break_labels, ofst,
-                               &state_mapping, &isym_mapping, &osym_mapping,
-                               &expanded_from, fst.Start(), ofst->Start(),
-                               Weight::One(), &tmp_inp, &tmp_out);
-
-  if (symbols_inp) {
-    symbols_inp->resize(isym_mapping.size());
-    for (auto it = isym_mapping.begin(); it != isym_mapping.end(); ++it)
-      (*symbols_inp)[it->second] = it->first;
-  }
-  if (symbols_out) {
-    symbols_out->resize(osym_mapping.size());
-    for (auto it = osym_mapping.begin(); it != osym_mapping.end(); ++it)
-      (*symbols_out)[it->second] = it->first;
-  }
-}
 
 size_t CountNumArcs(const kaldi::CompactLattice& lat) {
   size_t n = 0;
@@ -178,7 +178,7 @@ int main(int argc, char *argv[]) {
     std::string break_symbols_str = "";
     po.Register("separator-symbols", &break_symbols_str,
                 "Space-separated list of separator output symbols in the "
-                "original lattices");
+                "original lattices.");
     po.Register("acoustic-scale", &acoustic_scale,
                 "Scaling factor for acoustic likelihoods");
     po.Register("lm-scale", &lm_scale,
@@ -241,10 +241,25 @@ int main(int argc, char *argv[]) {
         n_error++;
         continue;
       }
+
+      // Replace all final states with epsilon transitions to a single final state.
+      // This is required by the expansion algorithm to work.
+      {
+        const CompactLatticeArc::StateId tmp_final = lat.AddState();
+        for (fst::StateIterator<CompactLattice> siter(lat); !siter.Done(); siter.Next()) {
+          const CompactLatticeWeight& final_weight = lat.Final(siter.Value());
+          if (final_weight != CompactLatticeWeight::Zero()) {
+            lat.AddArc(siter.Value(), CompactLatticeArc(0, 0, final_weight, tmp_final));
+            lat.SetFinal(siter.Value(), CompactLatticeWeight::Zero());
+          }
+        }
+        lat.SetFinal(tmp_final, CompactLatticeWeight::One());
+      }
+
+      // Get expanded lattice
       CompactLattice flat;
-      std::vector< std::vector<fst::StdArc::Label> > isymbols;
-      std::vector< std::vector<fst::StdArc::Label> > osymbols;
-      FstExpandWithBreaks(lat, break_symbols, &flat, &isymbols, &osymbols);
+      fst::ExpandFstWithBreakLabels<CompactLatticeArc> expander(lat, &flat, break_symbols);
+
       const size_t expanded_num_states = flat.NumStates();
       const size_t expanded_num_arcs   = CountNumArcs(flat);
       KALDI_LOG << "Lattice " << key << " expanded from "
@@ -252,12 +267,13 @@ int main(int argc, char *argv[]) {
                 << original_num_arcs << " arcs to "
                 << expanded_num_states << " states and "
                 << expanded_num_arcs << " arcs.";
+
       // Scale Lattice back to the original scale
       fst::ScaleLattice(inv_scale, &flat);
       // Write CompactLattice
       lattice_writer.Write(key, flat);
       // Write output symbols
-      symbols_writer.Write(key, osymbols);
+      //symbols_writer.Write(key, osymbols);
       n_done++;
     }
     KALDI_LOG << "Done " << n_done << " lattices, errors on " << n_error;
