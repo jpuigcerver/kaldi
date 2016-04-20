@@ -48,6 +48,14 @@ class ExpandFstWithBreakLabels {
 
   inline const LabelMap& OutputMap() const { return osym_map_; }
 
+  inline void CreateFactorFstOnInput(MutableFst<Arc>* fst) const {
+    CreateFactorFst(isym_map_, fst);
+  }
+
+  inline void CreateFactorFstOnOutput(MutableFst<Arc>* fst) const {
+    CreateFactorFst(osym_map_, fst);
+  }
+
  private:
   const Fst<Arc>& ifst_;
   MutableFst<Arc>* ofst_;
@@ -60,6 +68,15 @@ class ExpandFstWithBreakLabels {
   static Label FindOrAssignLabel(const std::vector<Label>& v, LabelMap* m) {
     KALDI_ASSERT(m != NULL);
     return m->insert(std::make_pair(v, m->size())).first->second;
+  }
+
+  static void CreateFactorFst(const LabelMap& m, MutableFst<Arc>* fst) {
+    std::vector< std::vector<Label> > tmp_v(m.size());
+    for (typename LabelMap::const_iterator it = m.begin(); it != m.end(); ++it) {
+      if (it->second == 0) continue;  // epsilon is always 0
+      tmp_v.push_back(it->first);
+    }
+    fst::CreateFactorFst(tmp_v, fst);
   }
 
   void Expand() {
@@ -224,7 +241,7 @@ int main(int argc, char *argv[]) {
     CompactLatticeWriter lattice_writer(lats_wspecifier);
 
     // Write symbols table.
-    Int32VectorVectorWriter symbols_writer(syms_wspecifier);
+    CompactLatticeWriter factor_writer(syms_wspecifier);
 
     int32 n_done = 0, n_error = 0;
     for (; !lattice_reader.Done(); lattice_reader.Next()) {
@@ -273,7 +290,10 @@ int main(int argc, char *argv[]) {
       // Write CompactLattice
       lattice_writer.Write(key, flat);
       // Write output symbols
-      //symbols_writer.Write(key, osymbols);
+      // Create a factor lattice, such that lat = flat * factor_lattice
+      CompactLattice factor_lattice;
+      expander.CreateFactorFstOnOutput(&factor_lattice);
+      factor_writer.Write(key, factor_lattice);
       n_done++;
     }
     KALDI_LOG << "Done " << n_done << " lattices, errors on " << n_error;
