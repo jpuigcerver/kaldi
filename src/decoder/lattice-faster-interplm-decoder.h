@@ -53,7 +53,8 @@ struct hash<fst::StdArc> {
 template <>
 struct equal_to<fst::StdArc> {
   bool operator()(const fst::StdArc& a, const fst::StdArc& b) const {
-    return true;
+    return a.ilabel == b.ilabel && a.olabel == b.olabel &&
+        a.weight == b.weight && a.nextstate == b.nextstate;
   }
 };
 
@@ -163,10 +164,9 @@ class LatticeFasterInterpLmDecoder {
   /// Returns true if result is nonempty (using the return status is deprecated,
   /// it will become void).  If "use_final_probs" is true AND we reached the
   /// final-state of the graph then it will include those as final-probs, else
-  /// it will treat all final-probs as one.  Note: this just calls GetRawLattice()
-  /// and figures out the shortest path.
-  bool GetBestPath(Lattice *ofst,
-                   bool use_final_probs = true) const;
+  /// it will treat all final-probs as one.
+  // Note: this just calls GetRawLattice() and figures out the shortest path.
+  bool GetBestPath(Lattice *ofst, bool use_final_probs = true) const;
 
   /// Outputs an FST corresponding to the raw, state-level
   /// tracebacks.  Returns true if result is nonempty.
@@ -174,19 +174,17 @@ class LatticeFasterInterpLmDecoder {
   /// of the graph then it will include those as final-probs, else
   /// it will treat all final-probs as one.
   /// The raw lattice will be topologically sorted.
-  bool GetRawLattice(Lattice *ofst,
-                     bool use_final_probs = true) const;
+  bool GetRawLattice(Lattice *ofst, bool use_final_probs = true) const;
 
 
   /// [Deprecated, users should now use GetRawLattice and determinize it
   /// themselves, e.g. using DeterminizeLatticePhonePrunedWrapper].
   /// Outputs an FST corresponding to the lattice-determinized
-  /// lattice (one path per word sequence).   Returns true if result is nonempty.
+  /// lattice (one path per word sequence). Returns true if result is nonempty.
   /// If "use_final_probs" is true AND we reached the final-state of the graph
   /// then it will include those as final-probs, else it will treat all
   /// final-probs as one.
-  bool GetLattice(CompactLattice *ofst,
-                  bool use_final_probs = true) const;
+  bool GetLattice(CompactLattice *ofst, bool use_final_probs = true) const;
 
   /// InitDecoding initializes the decoding, and should only be used if you
   /// intend to call AdvanceDecoding().  If you call Decode(), you don't need to
@@ -501,9 +499,11 @@ class LatticeFasterInterpLmDecoder {
   // Find all output arcs from state s with input label l, using the sorted
   // matcher m.
   static void FindILabelArcs(StateId s, Label l, fst::SortedMatcher<Fst>* m,
-                             std::vector<Arc>* arcs);
+                             std::vector<Arc>* arcs,
+                             std::unordered_set<Arc>* unmatched_arcs);
 
   void AddEmittingToken(
+      const StateTriplet& curr_state,
       Token* tok, StateId next_hcl, StateId next_lm1, StateId next_lm2,
       int32 frame, Label ilabel, Label olabel,
       BaseFloat tot_cost, BaseFloat hcl_cost, BaseFloat lm1_cost,
