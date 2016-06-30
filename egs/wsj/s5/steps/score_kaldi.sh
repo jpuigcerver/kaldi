@@ -14,6 +14,7 @@ beam=6
 word_ins_penalty=0.0,0.5,1.0
 min_lmwt=9
 max_lmwt=20
+iter=final
 #end configuration section.
 
 echo "$0 $@"  # Print the command line for logging
@@ -142,7 +143,7 @@ if [ $stage -le 1 ]; then
       compute-wer-bootci \
         ark:$dir/scoring_kaldi/test_filt.txt ark:$dir/scoring_kaldi/penalty_$best_wip/$best_lmwt.txt \
         '>' $dir/scoring_kaldi/wer_details/wer_bootci || exit 1;
-    
+
   fi
 fi
 
