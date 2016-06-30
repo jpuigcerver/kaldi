@@ -22,103 +22,55 @@
 #include "util/common-utils.h"
 #include "fstext/fstext-lib.h"
 #include "lat/kaldi-lattice.h"
+#include "lat/lattice-functions.h"
 
 namespace fst {
 
 template <typename Arc>
-void LinearScaleFst(const typename Arc::Weight& weight, MutableFst<Arc>* fst) {
+void AddToFinalCost(const typename Arc::Weight& weight,
+                    MutableFst<Arc>* fst) {
   KALDI_ASSERT(fst != NULL);
-  KALDI_ASSERT(fst->Start() != kNoStateId);
-  for (MutableArcIterator< MutableFst<Arc> > aiter(fst, fst->Start());
-       !aiter.Done(); aiter.Next()) {
-    Arc arc = aiter.Value();
-    arc.weight = Times(arc.weight, weight);
-    aiter.SetValue(arc);
+  for (StateIterator< Fst<Arc> > siter(*fst); !siter.Done(); siter.Next()) {
+    const typename Arc::Weight final_cost = fst->Final(siter.Value());
+    if (final_cost != Arc::Weight::Zero()) {
+      fst->SetFinal(siter.Value(), Times(final_cost, weight));
+    }
   }
 }
-
-template <typename FloatType>
-inline int Compare(const LogWeightTpl<FloatType>& w1,
-                   const LogWeightTpl<FloatType>& w2) {
-  if (w1.Value() == w2.Value()) return 0;
-  else if (w1.Value() > w2.Value()) return -1;
-  else return 1;
-}
-
-template <typename T, typename IntType>
-inline CompactLatticeWeightTpl<LogWeightTpl<T>, IntType> Plus(
-    const CompactLatticeWeightTpl<LogWeightTpl<T>, IntType>& w1,
-    const CompactLatticeWeightTpl<LogWeightTpl<T>, IntType>& w2) {
-  if (Compare(w1, w2) >= 0) {
-    return CompactLatticeWeightTpl<LogWeightTpl<T>, IntType>(
-        Plus(w1.Weight(), w2.Weight()), w1.String());
-  } else {
-    return CompactLatticeWeightTpl<LogWeightTpl<T>, IntType>(
-        Plus(w1.Weight(), w2.Weight()), w2.String());
-  }
-}
-
-template <typename FloatType, typename IntType>
-void ConvertLatticeWeight(
-    const CompactLatticeWeightTpl<LatticeWeightTpl<FloatType>, IntType>& w_in,
-    CompactLatticeWeightTpl<LogWeightTpl<FloatType>, IntType>* w_out) {
-  w_out->SetWeight(LogWeightTpl<FloatType>(
-      w_in.Weight().Value1() + w_in.Weight().Value2()));
-  w_out->SetString(w_in.String());
-}
-
-template <typename FloatType, typename IntType>
-void ConvertLatticeWeight(
-    const CompactLatticeWeightTpl<LogWeightTpl<FloatType>, IntType>& w_in,
-    CompactLatticeWeightTpl<LatticeWeightTpl<FloatType>, IntType>* w_out) {
-  w_out->SetWeight(LatticeWeightTpl<FloatType>(w_in.Weight().Value(), 0.0));
-  w_out->SetString(w_in.String());
-}
-
-template <>
-uint64 CompactLatticeWeightTpl<LogWeight, kaldi::int32>::Properties() {
-  return kLeftSemiring | kRightSemiring;
-}
-
-typedef CompactLatticeWeightTpl<LogWeight, kaldi::int32>
-CustomCompactLatticeWeight;
-
-typedef ArcTpl<CustomCompactLatticeWeight> CustomCompactLatticeArc;
-
-typedef VectorFst<CustomCompactLatticeArc> CustomCompactLattice;
 
 }  // namespace fst
+
+bool debug_location = false;
+void signal_handler(int) { debug_location = true; }
 
 int main(int argc, char *argv[]) {
   try {
     using namespace kaldi;
     const char *usage =
-        "Takes two archives of lattices (indexed by utterances) and linearly\n"
-        "interpolates the individual lattice pairs (one from each archive).\n"
-        "You can control the interpolation weights with --alpha, which is the\n"
-        "weight of the first lattices (the second is 1-alpha).\n"
-        "The interpolated lattice is determinized (and optionally minimized)\n"
-        "before being written. The determinization algorithm keeps the best\n"
-        "alignment for each sequence of output symbols (typically, words).\n\n"
         "Usage: lattice-linear-interp [options] lattice-rspecifier-a "
         "lattice-rspecifier-b lattice-wspecifier\n"
-        "  e.g.: lattice-linear-interp ark:1.lats ark:2.lats ark:interp.lats\n";
+        "  e.g.: lattice-linear-interp ark:lat1.ark ark:lat2.ark ark:fst.ark\n";
 
     ParseOptions po(usage);
-    BaseFloat alpha = 0.5; // Scale of 1st in the pair.
-    BaseFloat acoustic_scale1 = 1.0;
-    BaseFloat acoustic_scale2 = 1.0;
-    BaseFloat lm_scale1 = 1.0;
-    BaseFloat lm_scale2 = 1.0;
-    BaseFloat acoustic2lm_scale1 = 0.0;
-    BaseFloat acoustic2lm_scale2 = 0.0;
-    BaseFloat lm2acoustic_scale1 = 0.0;
-    BaseFloat lm2acoustic_scale2 = 0.0;
+    BaseFloat alpha = 0.5; // Interpolation weight for lattice 1
+    BaseFloat acoustic_scale1 = 1.0, acoustic_scale2 = 1.0;
+    BaseFloat lm_scale1 = 1.0, lm_scale2 = 1.0;
+    BaseFloat ins_penalty1 = 0.0, ins_penalty2 = 0.0;
+    BaseFloat delta = fst::kDelta;
+    BaseFloat beam = std::numeric_limits<BaseFloat>::infinity();
+    int max_states = -1;
     bool minimize = true;
 
     po.Register("alpha", &alpha,
                 "Scale of the first lattice in the pair. It must be in the "
-                "range (0, 1)");
+                "range [0, 1]");
+    po.Register("beam", &beam,
+                "Pruning beam [applied after scaling and union]");
+    po.Register("delta", &delta,
+                "Delta value used to determine equivalence of weights");
+    po.Register("max-states", &max_states,
+                "Maximum number of states in determinized FST before it will "
+                "abort");
     po.Register("minimize", &minimize,
                 "If true, push and minimize after determinization");
     po.Register("acoustic-scale1", &acoustic_scale1,
@@ -126,21 +78,10 @@ int main(int argc, char *argv[]) {
     po.Register("acoustic-scale2", &acoustic_scale2,
                 "Acoustic costs scaling factor of the second lattice");
     po.Register("lm-scale1", &lm_scale1,
-                "Graph/lm costs scaling factor of the first lattice");
+                "Graph/LM costs scaling factor of the first lattice");
     po.Register("lm-scale2", &lm_scale2,
-                "Graph/lm costs scaling factor of the second lattice");
-    po.Register("acoustic2lm-scale1", &acoustic2lm_scale1,
-                "Add this times original acoustic costs to LM costs "
-                "of the first lattice");
-    po.Register("acoustic2lm-scale2", &acoustic2lm_scale2,
-                "Add this times original acoustic costs to LM costs "
-                "of the second lattice");
-    po.Register("lm2acoustic-scale1", &lm2acoustic_scale1,
-                "Add this times original LM costs to acoustic costs "
-                "of the first lattice");
-    po.Register("lm2acoustic-scale2", &lm2acoustic_scale2,
-                "Add this times original LM costs to acoustic costs "
-                "of the second lattice");
+                "Graph/LM costs scaling factor of the second lattice");
+
     po.Read(argc, argv);
 
     if (po.NumArgs() != 3) {
@@ -150,99 +91,89 @@ int main(int argc, char *argv[]) {
     // Avoid numerical problems with 1.0 - alpha
     if (alpha < std::numeric_limits<float>::epsilon()) {
       alpha = 0.0f;
-      KALDI_WARN << "--alpha is approximately 0.0";
+      KALDI_WARN << "--alpha is rounded to 0.0";
     } else if (alpha > (1.0f - std::numeric_limits<float>::epsilon())) {
       alpha = 1.0f;
-      KALDI_WARN << "--alpha is approximately 1.0";
+      KALDI_WARN << "--alpha is rounded to 1.0";
     }
 
-    std::vector<std::vector<double> > scale1(2);
-    scale1[0].resize(2);
-    scale1[1].resize(2);
-    scale1[0][0] = lm_scale1;
-    scale1[0][1] = acoustic2lm_scale1;
-    scale1[1][0] = lm2acoustic_scale1;
-    scale1[1][1] = acoustic_scale1;
-    std::vector<std::vector<double> > scale2(2);
-    scale2[0].resize(2);
-    scale2[1].resize(2);
-    scale2[0][0] = lm_scale2;
-    scale2[0][1] = acoustic2lm_scale2;
-    scale2[1][0] = lm2acoustic_scale2;
-    scale2[1][1] = acoustic_scale2;
+    std::vector<std::vector<double> > scale1{
+      std::vector<double>{lm_scale1, 0.0},
+      std::vector<double>{0.0, acoustic_scale1}};
+    std::vector<std::vector<double> > scale2{
+      std::vector<double>{lm_scale2, 0.0},
+      std::vector<double>{0.0, acoustic_scale2}};
 
     std::string lats_rspecifier1 = po.GetArg(1),
         lats_rspecifier2 = po.GetArg(2),
-        lats_wspecifier = po.GetArg(3);
+        fsts_wspecifier = po.GetArg(3);
 
     SequentialCompactLatticeReader lattice_reader1(lats_rspecifier1);
     RandomAccessCompactLatticeReader lattice_reader2(lats_rspecifier2);
-
-    CompactLatticeWriter compact_lattice_writer(lats_wspecifier);
+    TableWriter<fst::VectorFstHolder> fst_writer(fsts_wspecifier);
 
     int32 n_processed=0, n_success=0, n_no_2ndlat=0;
 
     for (; !lattice_reader1.Done(); lattice_reader1.Next()) {
       std::string key = lattice_reader1.Key();
-      // Read first compact lattice, convert it to the custom format and
-      // linearly scale with alpha.
-      fst::CustomCompactLattice cclat1;
-      if (alpha > 0.0) {
-        CompactLattice temp = lattice_reader1.Value();
-        lattice_reader1.FreeCurrent();
-        fst::ScaleLattice(scale1, &temp);
-        ConvertLattice(temp, &cclat1);
-        fst::LinearScaleFst(fst::CustomCompactLatticeWeight(
-            fst::LogWeight(-log(alpha)),
-            std::vector<kaldi::int32>()), &cclat1);
-      }
-
-      if (lattice_reader2.HasKey(key)) {
-        ++n_processed;
-        // Read second compact lattice, convert it to the custom format and
-        // linearly scale it with 1.0 - alpha.
-        fst::CustomCompactLattice cclat2;
-        if (alpha < 1.0) {
-          CompactLattice temp = lattice_reader2.Value(key);
-          fst::ScaleLattice(scale2, &temp);
-          ConvertLattice(temp, &cclat2);
-          fst::LinearScaleFst(fst::CustomCompactLatticeWeight(
-              fst::LogWeight(-log(1.0-alpha)),
-              std::vector<kaldi::int32>()), &cclat2);
-        }
-        // Deterministic union of the two custom and scaled lattices,
-        // to create the linearly interpolated lattice. Optionally, also
-        // minimizes the output lattice.
-        CompactLattice lat3;
-        fst::CustomCompactLattice temp, temp2;
-        if (alpha > 0.0 && alpha < 1.0) {
-          fst::Determinize(
-              fst::UnionFst<fst::CustomCompactLatticeArc>(cclat1, cclat2),
-              &temp);
-          if (minimize) {
-            fst::Minimize(&temp, &temp2);
-          }
-        } else if (alpha > 0.0) {
-          // alpha is approximately 1.0
-          fst::Determinize(cclat1, &temp);
-          if (minimize) {
-            fst::Minimize(&temp, &temp2);
-          }
-        } else {
-          // alpha is approximately 0.0
-          fst::Determinize(cclat2, &temp);
-          if (minimize) {
-            fst::Minimize(&temp, &temp2);
-          }
-        }
-        ConvertLattice(temp2, &lat3);
-        compact_lattice_writer.Write(key, lat3);
-        ++n_success;
-      } else {
+      if (!lattice_reader2.HasKey(key)) {
         KALDI_WARN << "No lattice found for utterance " << key << " in "
                    << lats_rspecifier2 << ". Not producing output";
         ++n_no_2ndlat;
+        continue;
       }
+      ++n_processed;
+      kaldi::CompactLattice clat1, clat2;
+      fst::VectorFst<fst::StdArc> fst1, fst2;
+      if (alpha > 0.0f) {
+        clat1 = lattice_reader1.Value();
+        lattice_reader1.FreeCurrent();
+        // Add interpolation weight to lattice 1
+        fst::AddToFinalCost(
+            CompactLatticeWeight(
+                LatticeWeight(-log(alpha), 0.0), std::vector<int>{}),
+            &clat1);
+        // Scale lattice 1
+        fst::ScaleLattice(scale1, &clat1);
+        kaldi::AddWordInsPenToCompactLattice(ins_penalty1, &clat1);
+        // Convert lattice to
+        ConvertLattice(clat1, &fst1);
+        clat1.DeleteStates();              // Free memory
+      }
+      if (alpha < 1.0f) {
+        clat2 = lattice_reader2.Value(key);
+        // Add interpolation weight to lattice 2
+        fst::AddToFinalCost(
+            CompactLatticeWeight(
+                LatticeWeight(-log(1.0f - alpha), 0.0), std::vector<int>{}),
+            &clat2);
+        // Scale lattice 2
+        fst::ScaleLattice(scale2, &clat2);
+        kaldi::AddWordInsPenToCompactLattice(ins_penalty2, &clat2);
+        ConvertLattice(clat2, &fst2);
+        clat2.DeleteStates();              // Free memory
+      }
+      fst::VectorFst<fst::StdArc>* fst_out;
+      if (alpha > 0.0f && alpha < 1.0f) {
+        fst_out = &fst1;
+        fst::Union(fst_out, fst2);  // Modifies fst1, actually
+      } else if (alpha == 1.0f) {
+        fst_out = &fst1;
+      } else if (alpha == 0.0f) {
+        fst_out = &fst2;
+      }
+      if (beam < std::numeric_limits<BaseFloat>::infinity()) {
+        const size_t ns0 = fst_out->NumStates(), na0 = fst::NumArcs(*fst_out);
+        fst::Prune(fst_out, beam);
+        const size_t ns1 = fst_out->NumStates(), na1 = fst::NumArcs(*fst_out);
+        KALDI_VLOG(1) << "Utterance " << key << ": Union prunned from "
+                      << ns0 << " states and " << na0 << " arcs to "
+                      << ns1 << " states and " << na1 << " arcs.";
+      }
+      fst::DeterminizeStarInLog(fst_out, delta, &debug_location, max_states);
+      if (minimize) { fst::MinimizeEncoded(fst_out, delta); }
+      fst_writer.Write(key, *fst_out);
+      ++n_success;
     }
     KALDI_LOG << "Done " << n_processed << " lattices; "
               << n_success << " had nonempty result; "
