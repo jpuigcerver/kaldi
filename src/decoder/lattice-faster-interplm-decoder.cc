@@ -553,26 +553,51 @@ void LatticeFasterInterpLmDecoder::ComputeFinalCosts(
     StateTriplet state = final_toks->key;
     Token *tok = final_toks->val;
     const Elem *next = final_toks->tail;
-    // Acumulated cost through HCL, including final
-    const BaseFloat tot_cost_nolm_with_final =
-        (tok->tot_cost - tok->LMCost()) + hcl_.Final(state[0]).Value();
-    // Acumulated cost through LM1, including final
-    const BaseFloat lm1_cost_with_final =
-        state[1] == fst::kNoStateId ? infinity :
-        tok->lm1_cost + lm1_.Final(state[1]).Value();
-    // Acumulated cost through LM2, including final
-    const BaseFloat lm2_cost_with_final =
-        state[2] == fst::kNoStateId ? infinity :
-        tok->lm2_cost + lm2_.Final(state[2]).Value();
-    // Total acumulated cost, including final
-    const BaseFloat tot_cost_with_final = tot_cost_nolm_with_final
-        - kaldi::LogAdd(-lm1_cost_with_final, -lm2_cost_with_final);
-    // Final weight for the token
-    const BaseFloat final_cost = tot_cost_with_final - tok->tot_cost;
-    best_cost = std::min(tok->tot_cost, best_cost);
+    // Initialize total cost with final and final cost to infinity, since
+    // this is the cost for all non final states
+    BaseFloat tot_cost_with_final = infinity, final_cost = infinity;
+    // Is the state in the HCL model final?
+    const bool is_final_hcl = hcl_.Final(state[0]) != Weight::Zero();
+    // Is the state in the LM1 model final?
+    const bool is_final_lm1 =
+        (state[1] != fst::kNoStateId) && (lm1_.Final(state[1]) != Weight::Zero());
+    // Is the state in the LM2 model final?
+    const bool is_final_lm2 =
+        (state[2] != fst::kNoStateId) && (lm2_.Final(state[2]) != Weight::Zero());
+    // Is the state in the INTERPOLATED LM final?
+    // NOTES:
+    // If the states in both LMs are final, then obviously yes.
+    // If there is only a path through one of the LM (the state of the other
+    // is kNoStateId), then the state if final too.
+    // However, if the two states are valid, but only one is final, then the
+    // state cannot be final, otherwise we would be duplicating some paths.
+    // The score of the 1-best path would not change, but the lattice would.
+    const bool is_final_lm_interp =
+        (is_final_lm1 && is_final_lm2) ||
+        (is_final_lm1 && state[2] == fst::kNoStateId) ||
+        (is_final_lm2 && state[1] == fst::kNoStateId);
+    if (is_final_hcl && is_final_lm_interp) {
+      // Acumulated cost through HCL, including final
+      const BaseFloat tot_cost_nolm_with_final =
+          (tok->tot_cost - tok->LMCost()) + hcl_.Final(state[0]).Value();
+      // Acumulated cost through LM1, including final
+      const BaseFloat lm1_cost_with_final =
+          state[1] == fst::kNoStateId ? infinity :
+          tok->lm1_cost + lm1_.Final(state[1]).Value();
+      // Acumulated cost through LM2, including final
+      const BaseFloat lm2_cost_with_final =
+          state[2] == fst::kNoStateId ? infinity :
+          tok->lm2_cost + lm2_.Final(state[2]).Value();
+      // Total acumulated cost, including final
+      tot_cost_with_final = tot_cost_nolm_with_final
+          - kaldi::LogAdd(-lm1_cost_with_final, -lm2_cost_with_final);
+      // Final weight for the token
+      final_cost = tot_cost_with_final - tok->tot_cost;
+    }
     best_cost_with_final = std::min(tot_cost_with_final, best_cost_with_final);
     if (final_costs != NULL && final_cost != infinity)
       (*final_costs)[tok] = final_cost;
+    best_cost = std::min(tok->tot_cost, best_cost);
     final_toks = next;
   }
   if (final_relative_cost != NULL) {
@@ -802,6 +827,8 @@ BaseFloat LatticeFasterInterpLmDecoder::ProcessEmitting(
   // do it this way as it's more robust to future code changes.
   cost_offsets_.resize(frame + 1, 0.0);
   cost_offsets_[frame] = cost_offset;
+
+  KALDI_LOG << "next_cutoff = " << next_cutoff;
 
   // the tokens are now owned here, in final_toks, and the hash is empty.
   // 'owned' is a complex thing here; the point is we need to call DeleteElem
@@ -1136,19 +1163,31 @@ void LatticeFasterInterpLmDecoder::FindILabelArcs(
     std::unordered_set<Arc>* unmatched_arcs) {
   KALDI_ASSERT(m != NULL);
   KALDI_ASSERT(arcs != NULL);
+  KALDI_ASSERT(unmatched_arcs != NULL);
   arcs->clear();
+  unmatched_arcs->clear();
   if (s != fst::kNoStateId) {
     m->SetState(s);
     for(m->Find(l); !m->Done(); m->Next()) {
-      arcs->push_back(m->Value());
+      const Arc& arc = m->Value();
+      auto insert_ret = unmatched_arcs->insert(arc);
+      // If an arc to the same state and same input/output labels already
+      // exists, update the previous arc's weight to be the log-sum of the two.
+      if (!insert_ret.second) {
+        const Arc cur_arc = *insert_ret.first;
+        const Arc new_arc(arc.ilabel, arc.olabel,
+                          Weight(-kaldi::LogAdd(-cur_arc.weight.Value(),
+                                                -arc.weight.Value())),
+                          arc.nextstate);
+        auto hint = insert_ret.first;
+        ++hint;
+        unmatched_arcs->erase(insert_ret.first);
+        unmatched_arcs->insert(hint, new_arc);
+      }
     }
   }
-  if (unmatched_arcs != NULL) {
-    unmatched_arcs->clear();
-    unmatched_arcs->insert(arcs->begin(), arcs->end());
-  }
+  arcs->assign(unmatched_arcs->begin(), unmatched_arcs->end());
 }
-
 
 
 } // end namespace kaldi.

@@ -37,6 +37,11 @@
 
 namespace std {
 
+// Compare StdArc
+// WARNING: Observe that weights are not used to compare the arcs.
+// We do this in this way, so multiple arcs to the same state and same
+// input/output labels can be subtituted by a single arc which is the log-sum
+// of all the original arcs. This solves some easy cases of non-determinism.
 template <>
 struct hash<fst::StdArc> {
   size_t operator()(const fst::StdArc& arc) const {
@@ -44,9 +49,9 @@ struct hash<fst::StdArc> {
     std::hash<fst::StdArc::StateId> state_hasher;
     const size_t hash_ilabel = label_hasher(arc.ilabel);
     const size_t hash_olabel = label_hasher(arc.olabel);
-    const size_t hash_weight = arc.weight.Hash();
+    //const size_t hash_weight = arc.weight.Hash();
     const size_t hash_nextstate = state_hasher(arc.nextstate);
-    return hash_ilabel ^ hash_olabel ^ hash_weight ^ hash_nextstate;
+    return hash_ilabel ^ hash_olabel ^ hash_nextstate; //^ hash_weight
   }
 };
 
@@ -54,7 +59,7 @@ template <>
 struct equal_to<fst::StdArc> {
   bool operator()(const fst::StdArc& a, const fst::StdArc& b) const {
     return a.ilabel == b.ilabel && a.olabel == b.olabel &&
-        a.weight == b.weight && a.nextstate == b.nextstate;
+        a.nextstate == b.nextstate /* && a.weight == b.weight */;
   }
 };
 
@@ -517,6 +522,19 @@ class LatticeFasterInterpLmDecoder {
     Token *new_tok = FindOrAddToken(StateTriplet(next_hcl, next_lm1, next_lm2),
                                     frame + 1, tot_cost, hcl_cost, lm1_cost,
                                     lm2_cost, NULL);
+    KALDI_LOG << "("
+              << curr_state[0] << ", "
+              << curr_state[1] << ", "
+              << curr_state[2]
+              << ") -> ("
+              << next_hcl << ", "
+              << next_lm1 << ", "
+              << next_lm2
+              << ") : ("
+              << ilabel << ", " << olabel << ", "
+              << exp(-hcl_arc_w) << ", "
+              << exp(-lm1_arc_w) << ", "
+              << exp(-lm2_arc_w) << ")";
     tok->links = new ForwardLink(new_tok, ilabel, olabel, nlkh, hcl_arc_w,
                                  lm1_arc_w, lm2_arc_w, tok->links);
   }
