@@ -227,8 +227,8 @@ class ForwardBackwardFstImpl :  public FstImpl<A> {
     states_.resize(nstates);
     // We need to fix the nextnode/prevnode from the arcs
     for (size_t s = 0; s < states_.size(); ++s) {
-      states_[s]->DeleteArcs<false>(arcs_to_delete);
-      states_[s]->DeleteArcs<true>(arcs_to_delete);
+      states_[s]->template DeleteArcs<false>(arcs_to_delete);
+      states_[s]->template DeleteArcs<true>(arcs_to_delete);
     }
     // Now, delete arcs
     for (A* arc: arcs_to_delete) {
@@ -268,7 +268,7 @@ class ForwardBackwardFstImpl :  public FstImpl<A> {
     }
     arcs.resize(arcs.size() - n);
     for (StateId t : other_states) {
-      states_[t]->DeleteArcs<!input_arcs>(arcs_to_delete);
+      states_[t]->template DeleteArcs<!input_arcs>(arcs_to_delete);
     }
     for (A* arc : arcs_to_delete) {
       delete arc;
@@ -507,35 +507,35 @@ class ForwardBackwardFst :
 
   template <bool input_arcs = false>
   size_t NumInputEpsilons(StateId s) const {
-    return GetImpl()->NumInputEpsilons<input_arcs>(s);
+    return GetImpl()->template NumInputEpsilons<input_arcs>(s);
   }
 
   template <bool input_arcs = false>
   size_t NumOutputEpsilons(StateId s) const {
-    return GetImpl()->NumOutputEpsilons<input_arcs>(s);
+    return GetImpl()->template NumOutputEpsilons<input_arcs>(s);
   }
 
   template <bool input_arcs = false>
   size_t NumArcs(StateId s) const {
-    return GetImpl()->NumArcs<input_arcs>(s);
+    return GetImpl()->template NumArcs<input_arcs>(s);
   }
 
   template <bool input_arcs = false>
   void DeleteArcs(StateId s, size_t n) {
     MutateCheck();
-    GetImpl()->DeleteArcs(s, n);
+    GetImpl()->template DeleteArcs(s, n);
   }
 
   template <bool input_arcs = false>
   void DeleteArcs() {
     MutateCheck();
-    GetImpl()->DeleteArcs();
+    GetImpl()->template DeleteArcs();
   }
 
   template <bool input_arcs = false>
   void ReserveArcs(StateId s, size_t n) {
     MutateCheck();
-    GetImpl()->ReserveArcs<input_arcs>(s, n);
+    GetImpl()->template ReserveArcs<input_arcs>(s, n);
   }
 
  private:
