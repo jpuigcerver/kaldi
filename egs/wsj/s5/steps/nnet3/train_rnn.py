@@ -83,6 +83,12 @@ def GetArgs():
                         help="""String to provide options directly to steps/nnet3/get_egs.sh script""")
 
     # trainer options
+    parser.add_argument("--trainer.srand", type=int, dest='srand',
+                        default = 0,
+                        help="Sets the random seed for model initialization and egs shuffling. "
+                        "Warning: This random seed does not control all aspects of this experiment. "
+                        "There might be other random seeds used in other stages of the experiment "
+                        "like data preparation (e.g. volume perturbation).")
     parser.add_argument("--trainer.num-epochs", type=int, dest='num_epochs',
                         default = 8,
                         help="Number of epochs to train the model")
@@ -176,6 +182,11 @@ def GetArgs():
     parser.add_argument("--trainer.optimization.shrink-threshold", type=float, dest='shrink_threshold',
                         default = 0.15,
                         help="If the derivative averages are below this threshold we scale the parameter matrices with the shrink-value. It is less than 0.25 for sigmoid non-linearities.")
+    parser.add_argument("--trainer.optimization.cv-minibatch-size", type=int, dest='cv_minibatch_size',
+            default = 256,
+            help="Size of the minibatch to be used in diagnostic jobs (use smaller value for BLSTMs to control memory usage)")
+
+
 
     # RNN specific trainer options
     parser.add_argument("--trainer.rnn.num-chunk-per-minibatch", type=int, dest='num_chunk_per_minibatch',
@@ -183,7 +194,7 @@ def GetArgs():
                         help="Number of sequences to be processed in parallel every minibatch" )
     parser.add_argument("--trainer.rnn.num-bptt-steps", type=int, dest='num_bptt_steps',
                         default=None,
-                        help="The number of time steps to back-propagate from the last label in the chunk. By default it is same as the chunk-width." )
+                        help="The number of time steps to back-propagate from the last label in the chunk. By default it is set to (chunk-width + 10)." )
 
     # General options
     parser.add_argument("--stage", type=int, default=-4,
@@ -208,7 +219,7 @@ def GetArgs():
                         help="""If true, remove egs after experiment""")
     parser.add_argument("--cleanup.preserve-model-interval", dest = "preserve_model_interval",
                         type=int, default=100,
-                        help="Determines iterations for which models will be preserved during cleanup. If iter % preserve_model_interval == 0 model will be preserved.")
+                        help="Determines iterations for which models will be preserved during cleanup. If mod(iter,preserve_model_interval) == 0 model will be preserved.")
 
     parser.add_argument("--reporting.email", dest = "email",
                         type=str, default=None, action = NullstrToNoneAction,
@@ -333,9 +344,9 @@ class RunOpts:
         self.realign_use_gpu = None
 
 
-def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
+def TrainNewModels(dir, iter, srand, num_jobs, num_archives_processed, num_archives,
                    raw_model_string, egs_dir,
-                   left_context, right_context, min_deriv_time,
+                   left_context, right_context, min_deriv_time, max_deriv_time,
                    momentum, max_param_change,
                    shuffle_buffer_size, num_chunk_per_minibatch,
                    cache_read_opt, run_opts):
@@ -364,16 +375,16 @@ def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
   nnet3-train {parallel_train_opts} {cache_read_opt} {cache_write_opt} \
   --print-interval=10 --momentum={momentum} \
   --max-param-change={max_param_change} \
-  --optimization.min-deriv-time={min_deriv_time} "{raw_model}" \
-  "ark,bg:nnet3-copy-egs {context_opts} ark:{egs_dir}/egs.{archive_index}.ark ark:- | nnet3-shuffle-egs --buffer-size={shuffle_buffer_size} --srand={iter} ark:- ark:-| nnet3-merge-egs --minibatch-size={num_chunk_per_minibatch} --measure-output-frames=false --discard-partial-minibatches=true ark:- ark:- |" \
+  --optimization.min-deriv-time={min_deriv_time} --optimization.max-deriv-time={max_deriv_time} "{raw_model}" \
+  "ark,bg:nnet3-copy-egs {context_opts} ark:{egs_dir}/egs.{archive_index}.ark ark:- | nnet3-shuffle-egs --buffer-size={shuffle_buffer_size} --srand={srand} ark:- ark:-| nnet3-merge-egs --minibatch-size={num_chunk_per_minibatch} --measure-output-frames=false --discard-partial-minibatches=true ark:- ark:- |" \
   {dir}/{next_iter}.{job}.raw
           """.format(command = run_opts.command,
                      train_queue_opt = run_opts.train_queue_opt,
-                     dir = dir, iter = iter, next_iter = iter + 1, job = job,
+                     dir = dir, iter = iter, srand = iter + srand, next_iter = iter + 1, job = job,
                      parallel_train_opts = run_opts.parallel_train_opts,
                      cache_read_opt = cache_read_opt, cache_write_opt = cache_write_opt,
                      momentum = momentum, max_param_change = max_param_change,
-                     min_deriv_time = min_deriv_time,
+                     min_deriv_time = min_deriv_time, max_deriv_time = max_deriv_time,
                      raw_model = raw_model_string, context_opts = context_opts,
                      egs_dir = egs_dir, archive_index = archive_index,
                      shuffle_buffer_size = shuffle_buffer_size,
@@ -394,21 +405,47 @@ def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
         open('{0}/.error'.format(dir), 'w').close()
         raise Exception("There was error during training iteration {0}".format(iter))
 
-def TrainOneIteration(dir, iter, egs_dir,
+def TrainOneIteration(dir, iter, srand, egs_dir,
                       num_jobs, num_archives_processed, num_archives,
                       learning_rate, shrinkage_value, num_chunk_per_minibatch,
                       num_hidden_layers, add_layers_period,
-                      left_context, right_context, min_deriv_time,
+                      left_context, right_context, min_deriv_time, max_deriv_time,
                       momentum, max_param_change, shuffle_buffer_size,
-                      run_opts):
+                      cv_minibatch_size, run_opts):
     # Set off jobs doing some diagnostics, in the background.
     # Use the egs dir from the previous iteration for the diagnostics
     logger.info("Training neural net (pass {0})".format(iter))
 
-    ComputeTrainCvProbabilities(dir, iter, egs_dir, run_opts)
+    # check if different iterations use the same random seed
+    if os.path.exists('{0}/srand'.format(dir)):
+        try:
+            saved_srand = int(open('{0}/srand'.format(dir), 'r').readline().strip())
+        except IOError, ValueError:
+            raise Exception('Exception while reading the random seed for training')
+        if srand != saved_srand:
+            logger.warning("The random seed provided to this iteration (srand={0}) is different from the one saved last time (srand={1}). Using srand={0}.".format(srand, saved_srand))
+    else:
+        f = open('{0}/srand'.format(dir), 'w')
+        f.write(str(srand))
+        f.close()
+
+
+    ComputeTrainCvProbabilities(dir = dir,
+                                iter = iter,
+                                egs_dir = egs_dir,
+                                left_context = left_context,
+                                right_context = right_context,
+                                run_opts = run_opts,
+                                mb_size=cv_minibatch_size)
 
     if iter > 0:
-        ComputeProgress(dir, iter, egs_dir, run_opts)
+        ComputeProgress(dir = dir,
+                        iter = iter,
+                        egs_dir = egs_dir,
+                        left_context = left_context,
+                        right_context = right_context,
+                        run_opts = run_opts,
+                        mb_size=cv_minibatch_size)
 
     # an option for writing cache (storing pairs of nnet-computations
     # and computation-requests) during training.
@@ -418,7 +455,7 @@ def TrainOneIteration(dir, iter, egs_dir,
                            # best.
         cur_num_hidden_layers = 1 + iter / add_layers_period
         config_file = "{0}/configs/layer{1}.config".format(dir, cur_num_hidden_layers)
-        raw_model_string = "nnet3-am-copy --raw=true --learning-rate={lr} {dir}/{iter}.mdl - | nnet3-init --srand={iter} - {config} - |".format(lr=learning_rate, dir=dir, iter=iter, config=config_file)
+        raw_model_string = "nnet3-am-copy --raw=true --learning-rate={lr} {dir}/{iter}.mdl - | nnet3-init --srand={srand} - {config} - |".format(lr=learning_rate, dir=dir, iter=iter, srand=iter + srand, config=config_file)
     else:
         do_average = True
         if iter == 0:
@@ -442,12 +479,24 @@ def TrainOneIteration(dir, iter, egs_dir,
     except OSError:
         pass
 
-    TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
-                   raw_model_string, egs_dir,
-                   left_context, right_context, min_deriv_time,
-                   momentum, max_param_change,
-                   shuffle_buffer_size, cur_num_chunk_per_minibatch,
-                   cache_read_opt, run_opts)
+    TrainNewModels(dir = dir,
+                   iter = iter,
+                   srand = srand,
+                   num_jobs = num_jobs,
+                   num_archives_processed = num_archives_processed,
+                   num_archives = num_archives,
+                   raw_model_string = raw_model_string,
+                   egs_dir = egs_dir,
+                   left_context = left_context,
+                   right_context = right_context,
+                   min_deriv_time = min_deriv_time,
+                   max_deriv_time = max_deriv_time,
+                   momentum = momentum,
+                   max_param_change = max_param_change,
+                   shuffle_buffer_size = shuffle_buffer_size,
+                   num_chunk_per_minibatch = cur_num_chunk_per_minibatch,
+                   cache_read_opt = cache_read_opt,
+                   run_opts = run_opts)
     [models_to_average, best_model] = GetSuccessfulModels(num_jobs, '{0}/log/train.{1}.%.log'.format(dir,iter))
     nnets_list = []
     for n in models_to_average:
@@ -539,6 +588,7 @@ def Train(args, run_opts):
                     args.chunk_width + left_context,
                     args.chunk_width + right_context, run_opts,
                     frames_per_eg = args.chunk_width,
+                    srand = args.srand,
                     egs_opts = args.egs_opts,
                     cmvn_opts = args.cmvn_opts,
                     online_ivector_dir = args.online_ivector_dir,
@@ -601,11 +651,13 @@ def Train(args, run_opts):
     cur_egs_dir=egs_dir
 
     if args.num_bptt_steps is None:
-        num_bptt_steps = args.chunk_width
+        # num_bptt_steps is set to (chunk_width + 10) by default
+        num_bptt_steps = args.chunk_width + min(10, args.chunk_left_context, args.chunk_right_context)
     else:
         num_bptt_steps = args.num_bptt_steps
 
     min_deriv_time = args.chunk_width - num_bptt_steps
+    max_deriv_time = num_bptt_steps - 1
 
 
     logger.info("Training will run for {0} epochs = {1} iterations".format(args.num_epochs, num_iters))
@@ -631,15 +683,28 @@ def Train(args, run_opts):
             shrinkage_value = args.shrink_value if DoShrinkage(iter, model_file, "SigmoidComponent", args.shrink_threshold) else 1
             logger.info("On iteration {0}, learning rate is {1} and shrink value is {2}.".format(iter, learning_rate(iter, current_num_jobs, num_archives_processed), shrinkage_value))
 
-            TrainOneIteration(args.dir, iter, egs_dir, current_num_jobs,
-                              num_archives_processed, num_archives,
-                              learning_rate(iter, current_num_jobs, num_archives_processed),
-                              shrinkage_value,
-                              args.num_chunk_per_minibatch,
-                              num_hidden_layers, args.add_layers_period,
-                              left_context, right_context, min_deriv_time,
-                              args.momentum, args.max_param_change,
-                              args.shuffle_buffer_size, run_opts)
+            TrainOneIteration(dir = args.dir,
+                              iter = iter,
+                              srand = args.srand,
+                              egs_dir = egs_dir,
+                              num_jobs = current_num_jobs,
+                              num_archives_processed = num_archives_processed,
+                              num_archives = num_archives,
+                              learning_rate = learning_rate(iter, current_num_jobs, num_archives_processed),
+                              shrinkage_value = shrinkage_value,
+                              num_chunk_per_minibatch = args.num_chunk_per_minibatch,
+                              num_hidden_layers = num_hidden_layers,
+                              add_layers_period = args.add_layers_period,
+                              left_context = left_context,
+                              right_context = right_context,
+                              min_deriv_time = min_deriv_time,
+                              max_deriv_time = max_deriv_time,
+                              momentum = args.momentum,
+                              max_param_change= args.max_param_change,
+                              shuffle_buffer_size = args.shuffle_buffer_size,
+                              cv_minibatch_size = args.cv_minibatch_size,
+                              run_opts = run_opts)
+
             if args.cleanup:
                 # do a clean up everythin but the last 2 models, under certain conditions
                 RemoveModel(args.dir, iter-2, num_iters, num_iters_combine,
@@ -652,19 +717,31 @@ def Train(args, run_opts):
                     [report, times, data] = nnet3_log_parse.GenerateAccuracyReport(args.dir)
                     message = report
                     subject = "Update : Expt {dir} : Iter {iter}".format(dir = args.dir, iter = iter)
-                    sendMail(message, subject, args.email)
+                    SendMail(message, subject, args.email)
 
         num_archives_processed = num_archives_processed + current_num_jobs
 
     if args.stage <= num_iters:
         logger.info("Doing final combination to produce final.mdl")
-        CombineModels(args.dir, num_iters, num_iters_combine, egs_dir, run_opts,
-                chunk_width = args.chunk_width)
+        CombineModels(dir = args.dir,
+                      num_iters = num_iters,
+                      num_iters_combine = num_iters_combine,
+                      egs_dir = egs_dir,
+                      left_context = left_context,
+                      right_context = right_context,
+                      run_opts = run_opts,
+                      chunk_width = args.chunk_width)
 
     if args.stage <= num_iters + 1:
         logger.info("Getting average posterior for purposes of adjusting the priors.")
-        avg_post_vec_file = ComputeAveragePosterior(args.dir, 'combined', egs_dir,
-                                num_archives, args.prior_subset_size, run_opts)
+        avg_post_vec_file = ComputeAveragePosterior(dir = args.dir,
+                                                    iter = 'combined',
+                                                    egs_dir = egs_dir,
+                                                    num_archives = num_archives,
+                                                    prior_subset_size = args.prior_subset_size,
+                                                    left_context = left_context,
+                                                    right_context = right_context,
+                                                    run_opts = run_opts)
 
         logger.info("Re-adjusting priors based on computed posteriors")
         combined_model = "{dir}/combined.mdl".format(dir = args.dir)
@@ -686,11 +763,14 @@ def Train(args, run_opts):
     # do some reporting
     [report, times, data] = nnet3_log_parse.GenerateAccuracyReport(args.dir)
     if args.email is not None:
-        sendMail(report, "Update : Expt {0} : complete".format(args.dir), args.email)
+        SendMail(report, "Update : Expt {0} : complete".format(args.dir), args.email)
 
     report_handle = open("{dir}/accuracy.report".format(dir = args.dir), "w")
     report_handle.write(report)
     report_handle.close()
+
+    os.system("steps/info/nnet3_dir_info.sh " + args.dir)
+
 
 def Main():
     [args, run_opts] = GetArgs()
@@ -699,19 +779,9 @@ def Main():
     except Exception as e:
         if args.email is not None:
             message = "Training session for experiment {dir} died due to an error.".format(dir = args.dir)
-            sendMail(message, message, args.email)
+            SendMail(message, message, args.email)
         traceback.print_exc()
         raise e
-
-def SendMail(message, subject, email_id):
-    try:
-        subprocess.Popen('echo "{message}" | mail -s "{subject}" {email} '.format(
-            message = message,
-            subject = subject,
-            email = email_id), shell=True)
-    except Exception as e:
-        logger.info(" Unable to send mail due to error:\n {error}".format(error = str(e)))
-        pass
 
 if __name__ == "__main__":
     Main()

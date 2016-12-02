@@ -116,17 +116,17 @@ def GetArgs():
                         default = 3,
                         help="ratio of frames-per-second of input alignments to"
                         " chain model's output")
-    parser.add_argument("--chain.ngram-order", type=int, dest='ngram_order',
-                        default = 3, help="")
     parser.add_argument("--chain.left-deriv-truncate", type=int,
                         dest='left_deriv_truncate',
-                        default = None, help="")
-    parser.add_argument("--chain.right-deriv-truncate", type=int,
-                        dest='right_deriv_truncate',
-                        default = None, help="")
-
+                        default = None, help="Deprecated. Kept for back compatibility")
 
     # trainer options
+    parser.add_argument("--trainer.srand", type=int, dest='srand',
+                        default = 0,
+                        help="Sets the random seed for model initialization and egs shuffling. "
+                        "Warning: This random seed does not control all aspects of this experiment. "
+                        "There might be other random seeds used in other stages of the experiment "
+                        "like data preparation (e.g. volume perturbation).")
     parser.add_argument("--trainer.num-epochs", type=int, dest='num_epochs',
                         default = 10,
                         help="Number of epochs to train the model")
@@ -220,6 +220,14 @@ def GetArgs():
     parser.add_argument("--trainer.num-chunk-per-minibatch", type=int, dest='num_chunk_per_minibatch',
                         default=512,
                         help="Number of sequences to be processed in parallel every minibatch" )
+    parser.add_argument("--trainer.deriv-truncate-margin", type=int, dest='deriv_truncate_margin',
+                        default = None,
+                        help="(Relevant only for recurrent models). If specified, gives the margin "
+                        "(in input frames) around the 'required' part of each chunk that the "
+                        "derivatives are backpropagated to. If unset, the derivatives are "
+                        "backpropagated all the way to the boundaries of the input data. E.g. 8 is "
+                        "a reasonable setting. Note: the 'required' part of the chunk is defined by "
+                        "the model's {left,right}-context.")
 
     # General options
     parser.add_argument("--stage", type=int, default=-4,
@@ -242,7 +250,7 @@ def GetArgs():
                         help="If true, remove egs after experiment")
     parser.add_argument("--cleanup.preserve-model-interval", dest = "preserve_model_interval",
                         type=int, default=100,
-                        help="Determines iterations for which models will be preserved during cleanup. If iter % preserve_model_interval == 0 model will be preserved.")
+                        help="Determines iterations for which models will be preserved during cleanup. If mod(iter,preserve_model_interval) == 0 model will be preserved.")
 
     parser.add_argument("--reporting.email", dest = "email",
                         type=str, default=None, action = train_lib.NullstrToNoneAction,
@@ -254,7 +262,8 @@ def GetArgs():
     parser.add_argument("--feat-dir", type=str, required = True,
                         help="Directory with features used for training the neural network.")
     parser.add_argument("--tree-dir", type=str, required = True,
-                        help="Languade directory")
+                        help="Directory containing the tree to use for this model (we also "
+                        "expect final.mdl and ali.*.gz in that directory")
     parser.add_argument("--lat-dir", type=str, required = True,
                         help="Directory with alignments used for training the neural network.")
     parser.add_argument("--dir", type=str, required = True,
@@ -279,6 +288,12 @@ def ProcessArgs(args):
 
     if args.chunk_right_context < 0:
         raise Exception("--egs.chunk-right-context should be non-negative")
+
+    if not args.left_deriv_truncate is None:
+        args.deriv_truncate_margin = -args.left_deriv_truncate
+        logger.warning("--chain.left-deriv-truncate (deprecated) is set by user, "
+                "and --trainer.deriv-truncate-margin is set to negative of that value={0}. "
+                "We recommend using the option --trainer.deriv-truncate-margin.".format(args.deriv_truncate_margin))
 
     if (not os.path.exists(args.dir)) or (not os.path.exists(args.dir+"/configs")):
         raise Exception("""This scripts expects {0} to exist and have a configs
@@ -320,10 +335,10 @@ class RunOpts:
         self.parallel_train_opts = None
 
 
-def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
-                   raw_model_string, egs_dir,
+def TrainNewModels(dir, iter, srand, num_jobs, num_archives_processed, num_archives,
+                   raw_model_string, egs_dir, left_context, right_context,
                    apply_deriv_weights,
-                   left_deriv_truncate, right_deriv_truncate,
+                   min_deriv_time, max_deriv_time,
                    l2_regularize, xent_regularize, leaky_hmm_coefficient,
                    momentum, max_param_change,
                    shuffle_buffer_size, num_chunk_per_minibatch,
@@ -336,10 +351,10 @@ def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
       # but we use the same script for consistency with FF-DNN code
 
     deriv_time_opts=""
-    if left_deriv_truncate is not None:
-        deriv_time_opts += " --optimization.min-deriv-time={0}".format(left_deriv_truncate)
-    if right_deriv_truncate is not None:
-        deriv_time_opts += " --optimization.max-deriv-time={0}".format(int(chunk-width-right_deriv_truncate))
+    if not min_deriv_time is None:
+        deriv_time_opts += " --optimization.min-deriv-time={0}".format(min_deriv_time)
+    if not max_deriv_time is None:
+        deriv_time_opts += " --optimization.max-deriv-time={0}".format(max_deriv_time)
 
     processes = []
     for job in range(1,num_jobs+1):
@@ -362,11 +377,11 @@ def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
   --print-interval=10 --momentum={momentum} \
   --max-param-change={max_param_change} \
    "{raw_model}" {dir}/den.fst \
-  "ark,bg:nnet3-chain-copy-egs --truncate-deriv-weights={trunc_deriv} --frame-shift={fr_shft} ark:{egs_dir}/cegs.{archive_index}.ark ark:- | nnet3-chain-shuffle-egs --buffer-size={shuffle_buffer_size} --srand={iter} ark:- ark:-| nnet3-chain-merge-egs --minibatch-size={num_chunk_per_minibatch} ark:- ark:- |" \
+  "ark,bg:nnet3-chain-copy-egs --left-context={lc} --right-context={rc} --truncate-deriv-weights={trunc_deriv} --frame-shift={fr_shft} ark:{egs_dir}/cegs.{archive_index}.ark ark:- | nnet3-chain-shuffle-egs --buffer-size={shuffle_buffer_size} --srand={srand} ark:- ark:-| nnet3-chain-merge-egs --minibatch-size={num_chunk_per_minibatch} ark:- ark:- |" \
   {dir}/{next_iter}.{job}.raw
           """.format(command = run_opts.command,
                      train_queue_opt = run_opts.train_queue_opt,
-                     dir = dir, iter = iter, next_iter = iter + 1, job = job,
+                     dir = dir, iter = iter, srand = iter + srand, next_iter = iter + 1, job = job,
                      deriv_time_opts = deriv_time_opts,
                      trunc_deriv = truncate_deriv_weights,
                      app_deriv_wts = apply_deriv_weights,
@@ -375,11 +390,12 @@ def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
                      parallel_train_opts = run_opts.parallel_train_opts,
                      momentum = momentum, max_param_change = max_param_change,
                      raw_model = raw_model_string,
-                     egs_dir = egs_dir, archive_index = archive_index,
+                     egs_dir = egs_dir, lc=left_context, rc=right_context,
+                     archive_index = archive_index,
                      shuffle_buffer_size = shuffle_buffer_size,
                      cache_io_opts = cur_cache_io_opts,
                      num_chunk_per_minibatch = num_chunk_per_minibatch),
-          wait = False)
+                     wait = False)
 
         processes.append(process_handle)
 
@@ -396,11 +412,12 @@ def TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
         open('{0}/.error'.format(dir), 'w').close()
         raise Exception("There was error during training iteration {0}".format(iter))
 
-def TrainOneIteration(dir, iter, egs_dir,
+def TrainOneIteration(dir, iter, srand, egs_dir,
                       num_jobs, num_archives_processed, num_archives,
                       learning_rate, shrinkage_value, num_chunk_per_minibatch,
                       num_hidden_layers, add_layers_period,
-                      apply_deriv_weights, left_deriv_truncate, right_deriv_truncate,
+                      left_context, right_context,
+                      apply_deriv_weights, min_deriv_time, max_deriv_time,
                       l2_regularize, xent_regularize, leaky_hmm_coefficient,
                       momentum, max_param_change, shuffle_buffer_size,
                       frame_subsampling_factor, truncate_deriv_weights,
@@ -410,8 +427,28 @@ def TrainOneIteration(dir, iter, egs_dir,
     # Use the egs dir from the previous iteration for the diagnostics
     logger.info("Training neural net (pass {0})".format(iter))
 
-    chain_lib.ComputeTrainCvProbabilities(dir, iter, egs_dir,
-            l2_regularize, xent_regularize, leaky_hmm_coefficient, run_opts)
+    # check if different iterations use the same random seed
+    if os.path.exists('{0}/srand'.format(dir)):
+        try:
+            saved_srand = int(open('{0}/srand'.format(dir), 'r').readline().strip())
+        except IOError, ValueError:
+            raise Exception('Exception while reading the random seed for training')
+        if srand != saved_srand:
+            logger.warning("The random seed provided to this iteration (srand={0}) is different from the one saved last time (srand={1}). Using srand={0}.".format(srand, saved_srand))
+    else:
+        f = open('{0}/srand'.format(dir), 'w')
+        f.write(str(srand))
+        f.close()
+
+    chain_lib.ComputeTrainCvProbabilities(dir = dir,
+                                          iter = iter,
+                                          egs_dir = egs_dir,
+                                          left_context = left_context,
+                                          right_context = right_context,
+                                          l2_regularize = l2_regularize,
+                                          xent_regularize = xent_regularize,
+                                          leaky_hmm_coefficient = leaky_hmm_coefficient,
+                                          run_opts = run_opts)
 
     if iter > 0:
         chain_lib.ComputeProgress(dir, iter, run_opts)
@@ -422,7 +459,7 @@ def TrainOneIteration(dir, iter, egs_dir,
                            # best.
         cur_num_hidden_layers = 1 + iter / add_layers_period
         config_file = "{0}/configs/layer{1}.config".format(dir, cur_num_hidden_layers)
-        raw_model_string = "nnet3-am-copy --raw=true --learning-rate={lr} {dir}/{iter}.mdl - | nnet3-init --srand={iter} - {config} - |".format(lr=learning_rate, dir=dir, iter=iter, config=config_file)
+        raw_model_string = "nnet3-am-copy --raw=true --learning-rate={lr} {dir}/{iter}.mdl - | nnet3-init --srand={srand} - {config} - |".format(lr=learning_rate, dir=dir, iter=iter, srand=iter + srand, config=config_file)
         cache_io_opts = ""
     else:
         do_average = True
@@ -443,15 +480,30 @@ def TrainOneIteration(dir, iter, egs_dir,
       cur_num_chunk_per_minibatch = num_chunk_per_minibatch / 2
       cur_max_param_change = float(max_param_change) / math.sqrt(2)
 
-    TrainNewModels(dir, iter, num_jobs, num_archives_processed, num_archives,
-                   raw_model_string, egs_dir,
-                   apply_deriv_weights,
-                   left_deriv_truncate, right_deriv_truncate,
-                   l2_regularize, xent_regularize, leaky_hmm_coefficient,
-                   momentum, cur_max_param_change,
-                   shuffle_buffer_size, cur_num_chunk_per_minibatch,
-                   frame_subsampling_factor, truncate_deriv_weights,
-                   cache_io_opts, run_opts)
+    TrainNewModels(dir = dir,
+                   iter = iter,
+                   srand = srand,
+                   num_jobs = num_jobs,
+                   num_archives_processed = num_archives_processed,
+                   num_archives = num_archives,
+                   raw_model_string = raw_model_string,
+                   egs_dir = egs_dir,
+                   left_context = left_context,
+                   right_context = right_context,
+                   apply_deriv_weights = apply_deriv_weights,
+                   min_deriv_time = min_deriv_time,
+                   max_deriv_time = max_deriv_time,
+                   l2_regularize = l2_regularize,
+                   xent_regularize = xent_regularize,
+                   leaky_hmm_coefficient = leaky_hmm_coefficient,
+                   momentum = momentum,
+                   max_param_change = cur_max_param_change,
+                   shuffle_buffer_size = shuffle_buffer_size,
+                   num_chunk_per_minibatch = cur_num_chunk_per_minibatch,
+                   frame_subsampling_factor = frame_subsampling_factor,
+                   truncate_deriv_weights = truncate_deriv_weights,
+                   cache_io_opts = cache_io_opts,
+                   run_opts = run_opts)
 
     [models_to_average, best_model] = train_lib.GetSuccessfulModels(num_jobs, '{0}/log/train.{1}.%.log'.format(dir,iter))
     nnets_list = []
@@ -550,14 +602,15 @@ def Train(args, run_opts):
 
     left_context = args.chunk_left_context + model_left_context
     right_context = args.chunk_right_context + model_right_context
+    egs_left_context = left_context + args.frame_subsampling_factor/2
+    egs_right_context = right_context + args.frame_subsampling_factor/2
 
     default_egs_dir = '{0}/egs'.format(args.dir)
     if (args.stage <= -3) and args.egs_dir is None:
         logger.info("Generating egs")
         # this is where get_egs.sh is called.
         chain_lib.GenerateChainEgs(args.dir, args.feat_dir, args.lat_dir, default_egs_dir,
-                                    left_context + args.frame_subsampling_factor/2,
-                                    right_context + args.frame_subsampling_factor/2,
+                                    egs_left_context, egs_right_context,
                                     run_opts,
                                     left_tolerance = args.left_tolerance,
                                     right_tolerance = args.right_tolerance,
@@ -568,6 +621,7 @@ def Train(args, run_opts):
                                     cmvn_opts = args.cmvn_opts,
                                     online_ivector_dir = args.online_ivector_dir,
                                     frames_per_iter = args.frames_per_iter,
+                                    srand = args.srand,
                                     transform_dir = args.transform_dir,
                                     stage = args.egs_stage)
 
@@ -576,7 +630,7 @@ def Train(args, run_opts):
     else:
         egs_dir = args.egs_dir
 
-    [egs_left_context, egs_right_context, frames_per_eg, num_archives] = train_lib.VerifyEgsDir(egs_dir, feat_dim, ivector_dim, left_context, right_context)
+    [egs_left_context, egs_right_context, frames_per_eg, num_archives] = train_lib.VerifyEgsDir(egs_dir, feat_dim, ivector_dim, egs_left_context, egs_right_context)
     assert(args.chunk_width == frames_per_eg)
     num_archives_expanded = num_archives * args.frame_subsampling_factor
 
@@ -620,6 +674,12 @@ def Train(args, run_opts):
                                                                                            args.initial_effective_lrate,
                                                                                            args.final_effective_lrate)
 
+    min_deriv_time = None
+    max_deriv_time = None
+    if not args.deriv_truncate_margin is None:
+        min_deriv_time = -args.deriv_truncate_margin - model_left_context
+        max_deriv_time = args.chunk_width - 1 + args.deriv_truncate_margin + model_right_context
+
     logger.info("Training will run for {0} epochs = {1} iterations".format(args.num_epochs, num_iters))
     for iter in range(num_iters):
         if (args.exit_stage is not None) and (iter == args.exit_stage):
@@ -635,18 +695,32 @@ def Train(args, run_opts):
                 shrinkage_value = args.shrink_value
             logger.info("On iteration {0}, learning rate is {1} and shrink value is {2}.".format(iter, learning_rate(iter, current_num_jobs, num_archives_processed), shrinkage_value))
 
-            TrainOneIteration(args.dir, iter, egs_dir, current_num_jobs,
-                              num_archives_processed, num_archives,
-                              learning_rate(iter, current_num_jobs, num_archives_processed),
-                              shrinkage_value,
-                              args.num_chunk_per_minibatch,
-                              num_hidden_layers, args.add_layers_period,
-                              args.apply_deriv_weights, args.left_deriv_truncate, args.right_deriv_truncate,
-                              args.l2_regularize, args.xent_regularize, args.leaky_hmm_coefficient,
-                              args.momentum, args.max_param_change,
-                              args.shuffle_buffer_size,
-                              args.frame_subsampling_factor,
-                              args.truncate_deriv_weights, run_opts)
+            TrainOneIteration(dir = args.dir,
+                              iter = iter,
+                              srand = args.srand,
+                              egs_dir = egs_dir,
+                              num_jobs = current_num_jobs,
+                              num_archives_processed = num_archives_processed,
+                              num_archives = num_archives,
+                              learning_rate = learning_rate(iter, current_num_jobs, num_archives_processed),
+                              shrinkage_value = shrinkage_value,
+                              num_chunk_per_minibatch = args.num_chunk_per_minibatch,
+                              num_hidden_layers = num_hidden_layers,
+                              add_layers_period = args.add_layers_period,
+                              left_context = left_context,
+                              right_context = right_context,
+                              apply_deriv_weights = args.apply_deriv_weights,
+                              min_deriv_time = min_deriv_time,
+                              max_deriv_time = max_deriv_time,
+                              l2_regularize = args.l2_regularize,
+                              xent_regularize = args.xent_regularize,
+                              leaky_hmm_coefficient = args.leaky_hmm_coefficient,
+                              momentum = args.momentum,
+                              max_param_change = args.max_param_change,
+                              shuffle_buffer_size = args.shuffle_buffer_size,
+                              frame_subsampling_factor = args.frame_subsampling_factor,
+                              truncate_deriv_weights = args.truncate_deriv_weights,
+                              run_opts = run_opts)
             if args.cleanup:
                 # do a clean up everythin but the last 2 models, under certain conditions
                 train_lib.RemoveModel(args.dir, iter-2, num_iters, num_iters_combine,
@@ -665,10 +739,17 @@ def Train(args, run_opts):
 
     if args.stage <= num_iters:
         logger.info("Doing final combination to produce final.mdl")
-        chain_lib.CombineModels(args.dir, num_iters, num_iters_combine,
-                args.num_chunk_per_minibatch, egs_dir,
-                args.leaky_hmm_coefficient, args.l2_regularize,
-                args.xent_regularize, run_opts)
+        chain_lib.CombineModels(dir = args.dir,
+                                num_iters = num_iters,
+                                num_iters_combine = num_iters_combine,
+                                num_chunk_per_minibatch = args.num_chunk_per_minibatch,
+                                egs_dir = egs_dir,
+                                left_context = left_context,
+                                right_context = right_context,
+                                leaky_hmm_coefficient = args.leaky_hmm_coefficient,
+                                l2_regularize = args.l2_regularize,
+                                xent_regularize = args.xent_regularize,
+                                run_opts = run_opts)
 
     if args.cleanup:
         logger.info("Cleaning up the experiment directory {0}".format(args.dir))
@@ -690,6 +771,8 @@ def Train(args, run_opts):
     report_handle = open("{dir}/accuracy.report".format(dir = args.dir), "w")
     report_handle.write(report)
     report_handle.close()
+
+    os.system("steps/info/chain_dir_info.pl " + args.dir)
 
 def Main():
     [args, run_opts] = GetArgs()

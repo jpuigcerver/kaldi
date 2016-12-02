@@ -55,6 +55,11 @@ def CheckIfCudaCompiled():
     else:
         return True
 
+
+class KaldiCommandException(Exception):
+    def __init__(self, command, err):
+        Exception.__init__(self,"There was an error while running the command {0}\n".format(command)+"-"*10+"\n"+err)
+
 def RunKaldiCommand(command, wait = True):
     """ Runs commands frequently seen in Kaldi scripts. These are usually a
         sequence of commands connected by pipes, so we use shell=True """
@@ -66,7 +71,7 @@ def RunKaldiCommand(command, wait = True):
     if wait:
         [stdout, stderr] = p.communicate()
         if p.returncode is not 0:
-            raise Exception("There was an error while running the command {0}\n".format(command)+"-"*10+"\n"+stderr)
+            raise KaldiCommandException(command, stderr)
         return stdout, stderr
     else:
         return p
@@ -206,7 +211,7 @@ def GenerateEgs(data, alidir, egs_dir,
                 valid_left_context, valid_right_context,
                 run_opts, stage = 0,
                 feat_type = 'raw', online_ivector_dir = None,
-                samples_per_iter = 20000, frames_per_eg = 20,
+                samples_per_iter = 20000, frames_per_eg = 20, srand = 0,
                 egs_opts = None, cmvn_opts = None, transform_dir = None):
 
     RunKaldiCommand("""
@@ -222,6 +227,7 @@ steps/nnet3/get_egs.sh {egs_opts} \
   --stage {stage} \
   --samples-per-iter {samples_per_iter} \
   --frames-per-eg {frames_per_eg} \
+  --srand {srand} \
   {data} {alidir} {egs_dir}
       """.format(command = run_opts.command,
           cmvn_opts = cmvn_opts if cmvn_opts is not None else '',
@@ -232,7 +238,7 @@ steps/nnet3/get_egs.sh {egs_opts} \
           valid_left_context = valid_left_context,
           valid_right_context = valid_right_context,
           stage = stage, samples_per_iter = samples_per_iter,
-          frames_per_eg = frames_per_eg, data = data, alidir = alidir,
+          frames_per_eg = frames_per_eg, srand = srand, data = data, alidir = alidir,
           egs_dir = egs_dir,
           egs_opts = egs_opts if egs_opts is not None else '' ))
 
@@ -246,7 +252,10 @@ def VerifyEgsDir(egs_dir, feat_dim, ivector_dim, left_context, right_context):
             raise Exception('There is mismatch between featdim/ivector_dim of the current experiment and the provided egs directory')
 
         if (egs_left_context < left_context) or (egs_right_context < right_context):
-            raise Exception('The egs have insufficient context')
+            raise Exception('The egs have insufficient context.'
+                            ' Required left context is {rlc} and available left context is {alc}.'
+                            ' Required right context is {rrc} and available right context is {arc}.'.format(rlc = left_context, alc = egs_left_context,
+                                                                                                            rrc = right_context, arc = egs_right_context))
 
         frames_per_eg = int(open('{0}/info/frames_per_eg'.format(egs_dir)).readline())
         num_archives = int(open('{0}/info/num_archives'.format(egs_dir)).readline())
@@ -500,49 +509,65 @@ def DoShrinkage(iter, model_file, non_linearity, shrink_threshold):
 
     return False
 
-def ComputeTrainCvProbabilities(dir, iter, egs_dir, run_opts, wait = False):
+def ComputeTrainCvProbabilities(dir, iter, egs_dir, left_context, right_context,
+                                run_opts, mb_size=256, wait = False):
 
     model = '{0}/{1}.mdl'.format(dir, iter)
+
+    context_opts="--left-context={0} --right-context={1}".format(
+                  left_context, right_context)
 
     RunKaldiCommand("""
 {command} {dir}/log/compute_prob_valid.{iter}.log \
   nnet3-compute-prob "nnet3-am-copy --raw=true {model} - |" \
-        "ark,bg:nnet3-merge-egs ark:{egs_dir}/valid_diagnostic.egs ark:- |"
+        "ark,bg:nnet3-copy-egs {context_opts} ark:{egs_dir}/valid_diagnostic.egs ark:- | nnet3-merge-egs --minibatch-size={mb_size} ark:- ark:- |"
     """.format(command = run_opts.command,
                dir = dir,
                iter = iter,
+               mb_size = mb_size,
                model = model,
+               context_opts = context_opts,
                egs_dir = egs_dir), wait = wait)
 
     RunKaldiCommand("""
 {command} {dir}/log/compute_prob_train.{iter}.log \
   nnet3-compute-prob "nnet3-am-copy --raw=true {model} - |" \
-       "ark,bg:nnet3-merge-egs ark:{egs_dir}/train_diagnostic.egs ark:- |"
+        "ark,bg:nnet3-copy-egs {context_opts} ark:{egs_dir}/train_diagnostic.egs ark:- | nnet3-merge-egs --minibatch-size={mb_size} ark:- ark:- |"
     """.format(command = run_opts.command,
                dir = dir,
                iter = iter,
+               mb_size = mb_size,
                model = model,
+               context_opts = context_opts,
                egs_dir = egs_dir), wait = wait)
 
 
-def ComputeProgress(dir, iter, egs_dir, run_opts, wait=False):
+def ComputeProgress(dir, iter, egs_dir, left_context, right_context,
+                    run_opts, mb_size=256, wait=False):
 
     prev_model = '{0}/{1}.mdl'.format(dir, iter - 1)
     model = '{0}/{1}.mdl'.format(dir, iter)
+
+
+    context_opts="--left-context={0} --right-context={1}".format(
+                  left_context, right_context)
+
     RunKaldiCommand("""
 {command} {dir}/log/progress.{iter}.log \
 nnet3-info "nnet3-am-copy --raw=true {model} - |" '&&' \
 nnet3-show-progress --use-gpu=no "nnet3-am-copy --raw=true {prev_model} - |" "nnet3-am-copy --raw=true {model} - |" \
-"ark,bg:nnet3-merge-egs --minibatch-size=256 ark:{egs_dir}/train_diagnostic.egs ark:-|"
+"ark,bg:nnet3-copy-egs {context_opts}  ark:{egs_dir}/train_diagnostic.egs ark:- | nnet3-merge-egs --minibatch-size={mb_size} ark:- ark:-|"
     """.format(command = run_opts.command,
                dir = dir,
                iter = iter,
                model = model,
+               mb_size = mb_size,
                prev_model = prev_model,
+               context_opts = context_opts,
                egs_dir = egs_dir), wait = wait)
 
 def CombineModels(dir, num_iters, num_iters_combine, egs_dir,
-                  run_opts, chunk_width = None):
+                  run_opts, left_context, right_context, chunk_width = None):
     # Now do combination.  In the nnet3 setup, the logic
     # for doing averaging of subsets of the models in the case where
     # there are too many models to reliably esetimate interpolation
@@ -561,26 +586,39 @@ def CombineModels(dir, num_iters, num_iters_combine, egs_dir,
     else:
         mbsize = 1024
 
+
+    context_opts="--left-context={0} --right-context={1}".format(
+                  left_context, right_context)
+
     RunKaldiCommand("""
 {command} {combine_queue_opt} {dir}/log/combine.log \
 nnet3-combine --num-iters=40 \
    --enforce-sum-to-one=true --enforce-positive-weights=true \
-   --verbose=3 {raw_models} "ark,bg:nnet3-merge-egs --measure-output-frames=false --minibatch-size={mbsize} ark:{egs_dir}/combine.egs ark:-|" \
+   --verbose=3 {raw_models} "ark,bg:nnet3-copy-egs {context_opts} ark:{egs_dir}/combine.egs ark:- | \
+   nnet3-merge-egs --measure-output-frames=false --minibatch-size={mbsize} ark:- ark:-|" \
 "|nnet3-am-copy --set-raw-nnet=- {dir}/{num_iters}.mdl {dir}/combined.mdl"
     """.format(command = run_opts.command,
                combine_queue_opt = run_opts.combine_queue_opt,
                dir = dir, raw_models = " ".join(raw_model_strings),
                mbsize = mbsize,
                num_iters = num_iters,
+               context_opts = context_opts,
                egs_dir = egs_dir))
 
   # Compute the probability of the final, combined model with
   # the same subset we used for the previous compute_probs, as the
   # different subsets will lead to different probs.
-    ComputeTrainCvProbabilities(dir, 'combined', egs_dir, run_opts, wait = False)
+    ComputeTrainCvProbabilities(dir = dir,
+                                iter = 'combined',
+                                egs_dir = egs_dir,
+                                left_context = left_context,
+                                right_context = right_context,
+                                run_opts = run_opts,
+                                wait = False)
 
 def ComputeAveragePosterior(dir, iter, egs_dir, num_archives,
-                            prior_subset_size, run_opts):
+                            prior_subset_size, left_context, right_context,
+                            run_opts):
     # Note: this just uses CPUs, using a smallish subset of data.
     """ Computes the average posterior of the network"""
     import glob
@@ -592,19 +630,24 @@ def ComputeAveragePosterior(dir, iter, egs_dir, num_archives,
     else:
         egs_part = 'JOB'
 
+    context_opts="--left-context={0} --right-context={1}".format(
+                  left_context, right_context)
+
     RunKaldiCommand("""
 {command} JOB=1:{num_jobs_compute_prior} {prior_queue_opt} {dir}/log/get_post.{iter}.JOB.log \
-    nnet3-subset-egs --srand=JOB --n={prior_subset_size} ark:{egs_dir}/egs.{egs_part}.ark ark:- \| \
+    nnet3-copy-egs {context_opts} ark:{egs_dir}/egs.{egs_part}.ark ark:- \| \
+    nnet3-subset-egs --srand=JOB --n={prior_subset_size} ark:- ark:- \| \
     nnet3-merge-egs --measure-output-frames=true --minibatch-size=128 ark:- ark:- \| \
     nnet3-compute-from-egs {prior_gpu_opt} --apply-exp=true \
-  "nnet3-am-copy --raw=true {dir}/combined.mdl -|" ark:- ark:- \| \
-matrix-sum-rows ark:- ark:- \| vector-sum ark:- {dir}/post.{iter}.JOB.vec
+    "nnet3-am-copy --raw=true {dir}/combined.mdl -|" ark:- ark:- \| \
+    matrix-sum-rows ark:- ark:- \| vector-sum ark:- {dir}/post.{iter}.JOB.vec
     """.format(command = run_opts.command,
                dir = dir,
                num_jobs_compute_prior = run_opts.num_jobs_compute_prior,
                prior_queue_opt = run_opts.prior_queue_opt,
                iter = iter, prior_subset_size = prior_subset_size,
                egs_dir = egs_dir, egs_part = egs_part,
+               context_opts = context_opts,
                prior_gpu_opt = run_opts.prior_gpu_opt))
 
     # make sure there is time for $dir/post.{iter}.*.vec to appear.

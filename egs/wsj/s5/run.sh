@@ -59,11 +59,10 @@ local/wsj_format_data.sh --lang-suffix "_nosp" || exit 1;
 # Now make MFCC features.
 # mfccdir should be some place with a largish disk where you
 # want to store MFCC features.
-mfccdir=mfcc
+
 for x in test_eval92 test_eval93 test_dev93 train_si284; do
- steps/make_mfcc.sh --cmd "$train_cmd" --nj 20 \
-   data/$x exp/make_mfcc/$x $mfccdir || exit 1;
- steps/compute_cmvn_stats.sh data/$x exp/make_mfcc/$x $mfccdir || exit 1;
+  steps/make_mfcc.sh --cmd "$train_cmd" --nj 20 data/$x || exit 1;
+  steps/compute_cmvn_stats.sh data/$x || exit 1;
 done
 
 utils/subset_data_dir.sh --first data/train_si284 7138 data/train_si84 || exit 1
@@ -414,10 +413,6 @@ local/nnet/run_dnn.sh
 #  --normalize=true --map-utter=data/kws/utter_map \
 #  - exp/tri4b/decode_bd_tgpr_eval92/kws/kwslist.xml
 
-# # forward-backward decoding example [way to speed up decoding by decoding forward
-# # and backward in time]
-# local/run_fwdbwd.sh
-
 # # A couple of nnet3 recipes:
 # local/nnet3/run_tdnn_baseline.sh  # designed for exact comparison with nnet2 recipe
 # local/nnet3/run_tdnn.sh  # better absolute results
@@ -431,4 +426,3 @@ local/nnet/run_dnn.sh
 #                         --non-recurrent-projection-dim 128 \
 #                         --chunk-left-context 40 \
 #                         --chunk-right-context 40
-
