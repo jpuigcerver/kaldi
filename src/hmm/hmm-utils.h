@@ -183,11 +183,12 @@ void AddSelfLoops(const TransitionModel &trans_model,
   *                      see \ref hmm_scale.
   * @param  fst [in, out] The FST to be modified.
   */
+template <class F>
 void AddTransitionProbs(const TransitionModel &trans_model,
                         const std::vector<int32> &disambig_syms,
                         BaseFloat transition_scale,
                         BaseFloat self_loop_scale,
-                        fst::VectorFst<fst::StdArc> *fst);
+                        F *fst);
 
 /**
    This is as AddSelfLoops(), but operates on a Lattice, where
